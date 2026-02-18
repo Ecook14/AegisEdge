@@ -36,7 +36,7 @@ By matching CIDR ranges directly in memory during the request flow, the Geo-filt
 
 Engineering is about data, not claims. I built the `stress_tool.go` utility to rigorously validate the system's performance limits under simulated attacks.
 
-*   **Throughput**: **12,400+ Req/Sec** on standard infrastructure, showing the efficiency of the Go concurrency model.
+*   **Throughput**: **12,400+ Req/Sec** on standard infrastructure(Local machine), showing the efficiency of the Go concurrency model.
 *   **Effective Mitigation**: During a 1,000-request burst, the L7 rate limiting successfully shed **99% of excess load**, maintaining a perfect "200 OK" status for legitimate baseline traffic.
 *   **Minimal Overhead**: The combined security stack (WAF + GeoIP + Challenge) adds **less than 1ms** of latency per request.
 
