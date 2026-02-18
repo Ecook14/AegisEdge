@@ -40,6 +40,18 @@ func (s *RedisStore) Increment(key string, expiration time.Duration) (int64, err
 	return val, nil
 }
 
+func (s *RedisStore) Decrement(key string) (int64, error) {
+	return s.Client.Decr(s.ctx, key).Result()
+}
+
+func (s *RedisStore) GetCounter(key string) (int64, error) {
+	val, err := s.Client.Get(s.ctx, key).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return val, err
+}
+
 func (s *RedisStore) IsBlocked(key string) bool {
 	exists, err := s.Client.Exists(s.ctx, "block:"+key).Result()
 	if err != nil {

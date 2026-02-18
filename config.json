@@ -4,5 +4,7 @@
     "l3_blacklist": ["1.2.3.4", "5.6.7.8"],
     "l4_conn_limit": 10,
     "l7_rate_limit": 5.0,
-    "l7_burst_limit": 10
+    "l7_burst_limit": 10,
+    "geoip_db_path": "GeoLite2-Country.mmdb",
+    "blocked_countries": ["CN", "RU", "IR"]
 }

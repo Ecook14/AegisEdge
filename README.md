@@ -1,8 +1,13 @@
-# AegisEdge (goshield) 🛡️
+# AegisEdge: Enterprise Security Proxy
 
-**AegisEdge** is a high-performance security proxy engineered for the modern edge. It represents the culmination of lessons learned from managing infrastructure at scale—built for stability, performance, and proactive defense.
+AegisEdge is a high-performance security proxy designed to protect upstream services from L3-L7 threats. It features distributed state management, behavioral fingerprinting, and advanced anomaly detection.
 
-I spent significant time crafting this project to ensure it goes beyond basic proxying. It’s designed to be a "Zero-Trust" perimeter that handles malicious traffic patterns gracefully before they can impact upstream services.
+## Features
+
+- **Distributed L3-L7 Protection**: Core security filters (Rate Limiting, Connection Tracking, Anomaly Detection) utilize Redis for cluster-wide consistency.
+- **Behavioral Fingerprinting**: Identifies and blocks malicious clients based on HTTP header signatures and traffic patterns.
+- **Real-Time WAF**: Structured rule engine for blocking SQli, XSS, and other L7 attacks.
+- **GeoIP Blocking**: Country-level traffic restriction using MaxMind databases.
 
 ### The Philosophy behind AegisEdge
 The name is inspired by the **Aegis**—the legendary protective shield of Athena. It signifies an active, intelligent defense rather than a passive barrier. Locally, I keep the project as `goshield`—a direct nod to the efficiency of the Go runtime that powers the core engine. 
@@ -34,9 +39,9 @@ By matching CIDR ranges directly in memory during the request flow, the Geo-filt
 
 ## ⚡ Performance & Stress Validation
 
-Engineering is about data, not claims. I built the `stress_tool.go` utility to rigorously validate the system's performance limits under simulated attacks.
+Engineering is about data, not claims. I built the `cmd/stress_tool` utility to rigorously validate the system's performance limits under simulated attacks.
 
-*   **Throughput**: **12,400+ Req/Sec** on standard infrastructure, showing the efficiency of the Go concurrency model.
+*   **Throughput**: **12,400+ Req/Sec** on standard infrastructure(Local machine), showing the efficiency of the Go concurrency model.
 *   **Effective Mitigation**: During a 1,000-request burst, the L7 rate limiting successfully shed **99% of excess load**, maintaining a perfect "200 OK" status for legitimate baseline traffic.
 *   **Minimal Overhead**: The combined security stack (WAF + GeoIP + Challenge) adds **less than 1ms** of latency per request.
 
@@ -55,10 +60,10 @@ I’ve included a custom tool to verify the engineering thresholds I’ve set:
 
 ```bash
 # Baseline concurrency/performance validation
-go run stress_tool.go -n 1000 -c 50
+go run cmd/stress_tool/main.go -n 1000 -c 50
 
 # WAF 'SQLi' mitigation verification
-go run stress_tool.go -n 100 -c 10 -mode sqli
+go run cmd/stress_tool/main.go -n 100 -c 10 -mode sqli
 ```
 
 ---

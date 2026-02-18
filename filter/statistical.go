@@ -40,7 +40,7 @@ func (d *StatisticalAnomalyDetector) Middleware(next http.Handler) http.Handler 
 		if time.Since(d.LastReset).Seconds() >= float64(d.WindowSize) {
 			currentRPS := float64(d.RequestCount) / float64(d.WindowSize)
 			
-			// Simple Alpha-weighted moving average (0.1 for slow adaptation)
+			// Exponential Moving Average (EMA) for RPS tracking.
 			if d.MovingAvg == 0 {
 				d.MovingAvg = currentRPS
 			} else {
@@ -49,16 +49,16 @@ func (d *StatisticalAnomalyDetector) Middleware(next http.Handler) http.Handler 
 			
 			d.RequestCount = 0
 			d.LastReset = time.Now()
-			logger.Info("Statistical baseline updated", "rps_avg", d.MovingAvg)
+			logger.Info("Statistical RPS baseline updated", "rps_avg", d.MovingAvg)
 		}
 
-		// Check if current burst is anomalous (e.g. 5x the baseline)
-		// This is a simplified demo of a "Pulse" check
+		// Baseline comparison logic. 
+		// If current burst significantly exceeds the moving average, it indicates a volumetric anomaly.
 		if d.MovingAvg > 5 && float64(d.RequestCount) > d.MovingAvg*10 {
-			logger.Warn("Statistical Anomaly: Global traffic pulse detected", 
+			logger.Warn("Statistical Anomaly: Volumetric traffic peak detected", 
 				"avg", d.MovingAvg, "current_burst", d.RequestCount)
 			BlockedRequests.WithLabelValues("L7", "stat_anomaly").Inc()
-			// We don't block everything, we might trigger "Challenge Mode" for all
+			// Further action: Trigger defensive posture (e.g., CAPTCHA challenge for all traffic).
 		}
 		
 		d.mu.Unlock()

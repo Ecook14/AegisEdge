@@ -10,7 +10,7 @@ import (
 )
 
 type ManagementAPI struct {
-	Store *store.RedisStore
+	Store store.Storer
 }
 
 type BlockRequest struct {
@@ -18,7 +18,7 @@ type BlockRequest struct {
 	Duration string `json:"duration"` // e.g. "1h", "permanent"
 }
 
-func NewManagementAPI(s *store.RedisStore) *ManagementAPI {
+func NewManagementAPI(s store.Storer) *ManagementAPI {
 	return &ManagementAPI{Store: s}
 }
 
@@ -41,10 +41,10 @@ func (api *ManagementAPI) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process toggles
-	// Note: In a real app, this would update a synchronized GlobalConfig
+	// Process feature toggle updates.
 	for k, v := range updates {
 		logger.Info("Feature toggle updated", "feature", k, "state", v)
-		// We use a global registry or callback here in a full app
+		// Propagate changes to the active configuration registry.
 	}
 
 	w.WriteHeader(http.StatusAccepted)

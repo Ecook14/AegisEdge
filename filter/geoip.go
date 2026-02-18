@@ -3,35 +3,31 @@ package filter
 import (
 	"net"
 	"net/http"
-	"strings"
 
 	"aegisedge/logger"
+	"github.com/oschwald/geoip2-golang"
 )
 
 type GeoIPFilter struct {
-	BlockedRanges []*net.IPNet
+	db *geoip2.Reader
+	blockedCountries map[string]bool
 }
 
-func NewGeoIPFilter(blocked []string) *GeoIPFilter {
-	var ranges []*net.IPNet
-	for _, b := range blocked {
-		// Handle both single IPs and CIDR ranges
-		if !strings.Contains(b, "/") {
-			if strings.Count(b, ".") == 3 {
-				b += "/32"
-			} else if strings.Count(b, ":") >= 2 {
-				b += "/128"
-			}
-		}
-		
-		_, ipnet, err := net.ParseCIDR(b)
-		if err == nil {
-			ranges = append(ranges, ipnet)
-		} else {
-			logger.Error("Failed to parse blocked range", "range", b, "err", err)
-		}
+func NewGeoIPFilter(dbPath string, blockedCountries []string) *GeoIPFilter {
+	db, err := geoip2.Open(dbPath)
+	if err != nil {
+		logger.Warn("GeoIP filter bypassed: Database file not found", "path", dbPath, "tip", "Download GeoLite2-Country.mmdb from MaxMind to enable country blocking")
 	}
-	return &GeoIPFilter{BlockedRanges: ranges}
+
+	bc := make(map[string]bool)
+	for _, c := range blockedCountries {
+		bc[c] = true
+	}
+
+	return &GeoIPFilter{
+		db: db,
+		blockedCountries: bc,
+	}
 }
 
 func (f *GeoIPFilter) Middleware(next http.Handler) http.Handler {
@@ -39,25 +35,18 @@ func (f *GeoIPFilter) Middleware(next http.Handler) http.Handler {
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
 		
-		if f.isBlockedRegion(ip) {
-			logger.Warn("Blocked request from unauthorized region", "remote_addr", host)
-			BlockedRequests.WithLabelValues("L7", "geoip").Inc()
-			http.Error(w, "Access Denied: Region Restricted", http.StatusForbidden)
-			return
+		if f.db != nil && ip != nil {
+			record, err := f.db.Country(ip)
+			if err == nil {
+				if f.blockedCountries[record.Country.IsoCode] {
+					logger.Warn("Blocked request from unauthorized country", "remote_addr", host, "country", record.Country.IsoCode)
+					BlockedRequests.WithLabelValues("L7", "geoip").Inc()
+					http.Error(w, "Access Denied: Country Restricted", http.StatusForbidden)
+					return
+				}
+			}
 		}
 		
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (f *GeoIPFilter) isBlockedRegion(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	for _, block := range f.BlockedRanges {
-		if block.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }

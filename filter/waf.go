@@ -9,15 +9,16 @@ import (
 
 var (
 	// Expanded SQLi: looking for tautologies, comments, and dangerous keywords
-	sqliRegex = regexp.MustCompile(`(?i)(union.*select|insert.*into|drop.*table|delete.*from|update.*set|' or '1'='1|--|/\*|;.*--)`)
+	sqliRegex = regexp.MustCompile(`(?i)(union.*select|insert.*into|drop.*table|delete.*from|update.*set|' or '1'='1|--|/\*|;.*--|exec\(|sp_executesql|information_schema|sysdatabases|waitfor delay)`)
 	
 	// Expanded XSS: looking for event handlers, javascript pseudo-protocol, and script tags
-	xssRegex = regexp.MustCompile(`(?i)(<script|alert\(|onerror=|onload=|onmouseover=|javascript:|eval\(|unescape\()`)
+	xssRegex = regexp.MustCompile(`(?i)(<script|alert\(|onerror=|onload=|onmouseover=|javascript:|eval\(|unescape\(|String\.fromCharCode|<iframe|document\.(cookie|location)|window\.(location|open)|src=.*javascript:)`)
 	
 	// Command Injection: looking for shell operators and dangerous commands
-	cmdInjRegex = regexp.MustCompile(`(?i)(;|\||&&|>|<|\x60|\$\(.*\)|python|perl|bash|sh|cmd|powershell)`)
+	cmdInjRegex = regexp.MustCompile(`(?i)(;|\||&&|>|<|\x60|\$\(.*\)|python|perl|bash|sh|cmd|powershell|curl|wget|nc -e|/bin/sh|/bin/bash)`)
 	
-	traversal = regexp.MustCompile(`(?i)(\.\./|\.\.\\|/etc/passwd|/windows/system32|boot\.ini)`)
+	// Path Traversal and Sensitive File Access
+	traversal = regexp.MustCompile(`(?i)(\.\./|\.\.\\|/etc/passwd|/windows/system32|boot\.ini|windows/win\.ini|/var/www/html/.*\.env)`)
 )
 
 func WAFMiddleware(next http.Handler) http.Handler {

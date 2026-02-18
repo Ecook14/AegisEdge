@@ -7,13 +7,15 @@ import (
 )
 
 type Config struct {
-	ListenPort    int      `json:"listen_port"`
-	UpstreamAddr  string   `json:"upstream_addr"`
-	L3Blacklist   []string `json:"l3_blacklist"`
-	L4ConnLimit   int      `json:"l4_conn_limit"`
-	L7RateLimit   float64  `json:"l7_rate_limit"`
-	L7BurstLimit  int      `json:"l7_burst_limit"`
-	Toggles      FeatureFlags `json:"toggles"`
+	ListenPort       int          `json:"listen_port"`
+	UpstreamAddr     string       `json:"upstream_addr"`
+	L3Blacklist      []string     `json:"l3_blacklist"`
+	L4ConnLimit      int          `json:"l4_conn_limit"`
+	L7RateLimit      float64      `json:"l7_rate_limit"`
+	L7BurstLimit     int          `json:"l7_burst_limit"`
+	GeoIPDBPath      string       `json:"geoip_db_path"`
+	BlockedCountries []string     `json:"blocked_countries"`
+	Toggles          FeatureFlags `json:"toggles"`
 }
 
 type FeatureFlags struct {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,28 +35,29 @@ func main() {
 
 	logger.Info("Starting AegisEdge", "listen_port", cfg.ListenPort, "upstream", cfg.UpstreamAddr)
 
-	// Initialize Distributed Store
+	// Initialize Storage (Local with Redis upgrade)
+	var activeStore store.Storer = store.NewLocalStore()
 	redisAddr := os.Getenv("AEGISEDGE_REDIS_ADDR")
-	var redisStore *store.RedisStore
 	if redisAddr != "" {
-		redisStore = store.NewRedisStore(redisAddr, os.Getenv("AEGISEDGE_REDIS_PASSWORD"))
+		activeStore = store.NewRedisStore(redisAddr, os.Getenv("AEGISEDGE_REDIS_PASSWORD"))
 		logger.Info("Distributed state initialized (Redis)", "addr", redisAddr)
+	} else {
+		logger.Info("In-memory state initialized (Local fallback)")
 	}
 
 	// Initialize Filters
 	l3 := filter.NewL3Filter(cfg.L3Blacklist)
-	l4 := filter.NewL4Filter(cfg.L4ConnLimit, 5*time.Minute)
-	l7 := filter.NewL7Filter(cfg.L7RateLimit, cfg.L7BurstLimit)
-	geoip := filter.NewGeoIPFilter([]string{"45.", "185."})
+	l4 := filter.NewL4Filter(cfg.L4ConnLimit, 5*time.Minute, activeStore)
+	l7 := filter.NewL7Filter(cfg.L7RateLimit, cfg.L7BurstLimit, activeStore)
+	geoip := filter.NewGeoIPFilter(cfg.GeoIPDBPath, cfg.BlockedCountries)
 	fingerprinter := filter.NewFingerprinter()
-	anomaly := filter.NewAnomalyDetector([]string{"/search", "/api/heavy-export"}, 20)
-	stats := filter.NewStatisticalAnomalyDetector(60) // 1 minute windows
+	anomaly := filter.NewAnomalyDetector([]string{"/search", "/api/heavy-export"}, 20, activeStore)
+	stats := filter.NewStatisticalAnomalyDetector(60)
 
 	// Dynamic Toggle Wrapper
 	wrap := func(name string, enabled bool, next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// In a real high-perf app, this would read from an atomic boolean
-			// For this demo, we check the config
+			// Check if the filter is enabled in the current configuration.
 			if enabled {
 				next.ServeHTTP(w, r)
 			} else {
@@ -77,14 +79,16 @@ func main() {
 
 	// Combined Handler
 	finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Layer 3 (Distributed)
-		if redisStore != nil && redisStore.IsBlocked(r.RemoteAddr) {
-			filter.BlockedRequests.WithLabelValues("L3", "distributed_block").Inc()
-			http.Error(w, "Access Denied (Global Block)", http.StatusForbidden)
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		
+		// Layer 3 (Centralized Block Check)
+		if activeStore.IsBlocked(host) {
+			filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
+			http.Error(w, "Access Denied (Active Block)", http.StatusForbidden)
 			return
 		}
 
-		if l3.IsBlacklisted(r.RemoteAddr) {
+		if l3.IsBlacklisted(host) {
 			filter.BlockedRequests.WithLabelValues("L3", "blacklist").Inc()
 			http.Error(w, "Access Denied", http.StatusForbidden)
 			return
@@ -107,7 +111,7 @@ func main() {
 		p.ServeHTTP(w, r)
 	})
 
-	// Wrap with Security Middleware stack (applied in reverse order)
+	// Carry out the security pipeline:
 	// Tarpit -> WAF -> StatAnomaly -> Anomaly -> GeoIP -> Fingerprinting -> L7 Rate Limit -> Challenge -> Security Headers
 	stack := middleware.SecurityHeaders(
 		wrap("challenge", cfg.Toggles.Challenge, middleware.ProgressiveChallenge(
@@ -131,20 +135,18 @@ func main() {
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		logger.Info("Metrics active", "port", 9090)
+		logger.Info("Metrics engine active", "port", 9090)
 		http.ListenAndServe(":9090", mux)
 	}()
 
 	// Management API (Protected/Internal)
-	if redisStore != nil {
-		go func() {
-			mux := http.NewServeMux()
-			mgmt := manager.NewManagementAPI(redisStore)
-			mgmt.ServeHTTP(mux)
-			logger.Info("Management API active", "port", 9091)
-			http.ListenAndServe(":9091", mux)
-		}()
-	}
+	go func() {
+		mux := http.NewServeMux()
+		mgmt := manager.NewManagementAPI(activeStore)
+		mgmt.ServeHTTP(mux)
+		logger.Info("Management API active", "port", 9091)
+		http.ListenAndServe(":9091", mux)
+	}()
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.ListenPort),
