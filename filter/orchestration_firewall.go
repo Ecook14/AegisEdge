@@ -62,6 +62,45 @@ func UnblockIPKernel(ip string) error {
 	return nil
 }
 
+// TakeoverPort uses firewall redirection to "hijack" traffic from an occupied port.
+func TakeoverPort(occupiedPort, internalPort int) error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		// netsh interface portproxy add v4tov4 listenport=80 listenaddress=0.0.0.0 connectport=8888 connectaddress=127.0.0.1
+		cmd = exec.Command("netsh", "interface", "portproxy", "add", "v4tov4", 
+			fmt.Sprintf("listenport=%d", occupiedPort), "listenaddress=0.0.0.0", 
+			fmt.Sprintf("connectport=%d", internalPort), "connectaddress=127.0.0.1")
+	} else {
+		// iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8888
+		cmd = exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", 
+			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort))
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Error("Failed to hijack port via firewall", "from", occupiedPort, "to", internalPort, "err", err, "output", string(output))
+		return err
+	}
+	logger.Info("Port Hijack Active (Hot Takeover)", "external_port", occupiedPort, "internal_proxy_port", internalPort)
+	return nil
+}
+
+// ReleasePort removes the firewall redirection.
+func ReleasePort(occupiedPort, internalPort int) error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("netsh", "interface", "portproxy", "delete", "v4tov4", 
+			fmt.Sprintf("listenport=%d", occupiedPort), "listenaddress=0.0.0.0")
+	} else {
+		cmd = exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", 
+			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort))
+	}
+
+	cmd.Run()
+	logger.Info("Port Hijack Released", "port", occupiedPort)
+	return nil
+}
+
 func hardenWindows() {
 	logger.Info("Applying Windows network hardening...")
 	// Note: Detailed ICMP rate limiting in Windows requires specialized config, 

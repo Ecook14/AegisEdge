@@ -5,11 +5,13 @@ AegisEdge is a high-performance security proxy designed to protect upstream serv
 ## Features
 
 *   **L3/L4 OS Hardening**: Automatic kernel-level firewall orchestration (`netsh`/`iptables`) and ICMP rate-limiting to defend against network floods.
-*   **WAF (Web Application Firewall)**: Advanced regex-based detection for SQLi, XSS, and RCE.
-- **Distributed L3-L7 Protection**: Core security filters (Rate Limiting, Connection Tracking, Anomaly Detection) utilize Redis for cluster-wide consistency.
-- **Behavioral Fingerprinting**: Identifies and blocks malicious clients based on HTTP header signatures and traffic patterns.
-- **Real-Time WAF**: Structured rule engine for blocking SQli, XSS, and other L7 attacks.
-- **GeoIP Blocking**: Country-level traffic restriction using MaxMind databases.
+*   **WAF & L7 Shielding**: Advanced regex-based detection for SQLi, XSS, and RCE with full Port 443 HTTPS termination.
+*   **Universal Smart Takeover**: Zero-configuration deployment that auto-detects WHM, Plesk, and raw distros. Shields existing instances without downtime.
+*   **SSL Auto-Discovery**: Intelligent certificate probing for Let's Encrypt, cPanel, and standard system paths.
+*   **Distributed State**: Core security filters utilize Redis for cluster-wide consistency.
+*   **Behavioral Fingerprinting**: Identifies and blocks malicious clients based on signatures and patterns.
+*   **L4 TCP Shield**: Protect non-HTTP services like **SSH** and **Databases** from connection floods.
+*   **GeoIP Blocking**: Country-level traffic restriction using MaxMind databases.
 
 ### The Philosophy behind AegisEdge
 The name is inspired by the **Aegis**—the legendary protective shield of Athena. It signifies an active, intelligent defense rather than a passive barrier. Locally, I keep the project as `goshield`—a direct nod to the efficiency of the Go runtime that powers the core engine. 

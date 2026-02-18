@@ -152,34 +152,124 @@ func main() {
 
 	// Initialize Servers for all configured ports
 	var servers []*http.Server
+	hijackedPorts := make(map[int]int) // external -> internal
+
 	for _, port := range cfg.ListenPorts {
+		addr := fmt.Sprintf(":%d", port)
+		idleTimeout := 60 * time.Second
+		readTimeout := 15 * time.Second
+		if cfg.HypervisorMode {
+			logger.Info("Hypervisor optimized mode enabled", "port", port)
+			idleTimeout = 300 * time.Second
+			readTimeout = 30 * time.Second
+		}
+
 		srv := &http.Server{
-			Addr:              fmt.Sprintf(":%d", port),
+			Addr:              addr,
 			Handler:           stack,
 			ReadHeaderTimeout: 2 * time.Second,
-			ReadTimeout:       15 * time.Second,
+			ReadTimeout:       readTimeout,
 			WriteTimeout:      15 * time.Second,
-			IdleTimeout:       60 * time.Second,
+			IdleTimeout:       idleTimeout,
 		}
+
+		isHTTPS := (port == 443)
+		var cert, key string
+		if isHTTPS {
+			cert, key = cfg.DiscoverCerts()
+			if cert == "" || key == "" {
+				logger.Warn("Port 443 configured but SSL certificates could not be discovered. Falling back to HTTP.", "port", port)
+				isHTTPS = false
+			}
+		}
+
+		// Try to bind early to check status
+		ln, err := net.Listen("tcp", srv.Addr)
+		if err != nil && cfg.HotTakeover {
+			logger.Warn("Port occupied, attempting Hot Takeover...", "port", port)
+			// Start on any available port
+			tempLn, tempErr := net.Listen("tcp", "127.0.0.1:0")
+			if tempErr != nil {
+				logger.Error("Failed to start ephemeral server for takeover", "err", tempErr)
+				continue
+			}
+			
+			internalPort := tempLn.Addr().(*net.TCPAddr).Port
+			if err := filter.TakeoverPort(port, internalPort); err != nil {
+				logger.Error("Hot Takeover failed", "port", port, "err", err)
+				tempLn.Close()
+				continue
+			}
+			hijackedPorts[port] = internalPort
+			
+			if isHTTPS {
+				logger.Info("Hot Takeover active (HTTPS/L7 Protection)", "external", port, "internal", internalPort)
+				go srv.ServeTLS(tempLn, cert, key)
+			} else {
+				logger.Info("Hot Takeover active (HTTP/L7 Protection)", "external", port, "internal", internalPort)
+				go srv.Serve(tempLn)
+			}
+			servers = append(servers, srv)
+			continue
+		} else if err != nil {
+			logger.Error("Failed to listen on port", "port", port, "err", err)
+			os.Exit(1)
+		}
+
+		logger.Info("Proxy engine active", "addr", srv.Addr, "https", isHTTPS)
 		servers = append(servers, srv)
+		if isHTTPS {
+			go srv.ServeTLS(ln, cert, key)
+		} else {
+			go srv.Serve(ln)
+		}
+	}
+
+	// Initialize TCP Stream Protection for other ports (SSH, DB, etc.)
+	for _, port := range cfg.TcpPorts {
+		addr := fmt.Sprintf(":%d", port)
+		targetAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		ln, err := net.Listen("tcp", addr)
+		if err != nil && cfg.HotTakeover {
+			logger.Warn("TCP Port occupied, attempting Hot Takeover...", "port", port)
+			tempLn, tempErr := net.Listen("tcp", "127.0.0.1:0")
+			if tempErr != nil {
+				logger.Error("Failed to start ephemeral stream proxy", "err", tempErr)
+				continue
+			}
+
+			internalPort := tempLn.Addr().(*net.TCPAddr).Port
+			if err := filter.TakeoverPort(port, internalPort); err != nil {
+				logger.Error("TCP Hot Takeover failed", "port", port, "err", err)
+				tempLn.Close()
+				continue
+			}
+			hijackedPorts[port] = internalPort
+			
+			go filter.StreamProxy(tempLn, targetAddr, l4)
+			logger.Info("TCP Hot Takeover active (L4 Protection)", "external", port, "internal", internalPort)
+			continue
+		} else if err != nil {
+			logger.Error("Failed to listen on TCP port", "port", port, "err", err)
+			os.Exit(1)
+		}
+
+		logger.Info("TCP Stream Shield active", "port", port)
+		go filter.StreamProxy(ln, targetAddr, l4)
 	}
 
 	// Graceful shutdown logic
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	for _, srv := range servers {
-		go func(s *http.Server) {
-			logger.Info("Proxy engine active", "addr", s.Addr)
-			if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logger.Error("Server failed", "addr", s.Addr, "err", err)
-				os.Exit(1)
-			}
-		}(srv)
-	}
-
 	<-done
 	logger.Info("AegisEdge stopping...")
+
+	// Release Hijacked Ports
+	for ext, internal := range hijackedPorts {
+		filter.ReleasePort(ext, internal)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -189,9 +279,8 @@ func main() {
 		wg.Add(1)
 		go func(s *http.Server) {
 			defer wg.Done()
-			if err := s.Shutdown(ctx); err != nil {
-				logger.Error("Shutdown failed", "addr", s.Addr, "err", err)
-			}
+			// Don't log error here as some might already be closed via ln.Close()
+			s.Shutdown(ctx)
 		}(srv)
 	}
 	wg.Wait()
