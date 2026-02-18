@@ -1,8 +1,15 @@
-    # AegisEdge Usage Guide
+# AegisEdge Usage Guide
 
 This guide provides instructions on how to run, test, and manage the AegisEdge security proxy.
 
-## 1. Starting AegisEdge
+### 0. Start the Demo Upstream (Optional)
+To test the proxy without an external website, run the included demo server:
+```bash
+go run cmd/demo_server/main.go
+```
+This server listens on `localhost:3000`.
+
+## 1. Run AegisEdge
 
 To start the proxy with the default configuration:
 

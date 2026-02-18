@@ -4,6 +4,8 @@ AegisEdge is a high-performance security proxy designed to protect upstream serv
 
 ## Features
 
+*   **L3/L4 OS Hardening**: Automatic kernel-level firewall orchestration (`netsh`/`iptables`) and ICMP rate-limiting to defend against network floods.
+*   **WAF (Web Application Firewall)**: Advanced regex-based detection for SQLi, XSS, and RCE.
 - **Distributed L3-L7 Protection**: Core security filters (Rate Limiting, Connection Tracking, Anomaly Detection) utilize Redis for cluster-wide consistency.
 - **Behavioral Fingerprinting**: Identifies and blocks malicious clients based on HTTP header signatures and traffic patterns.
 - **Real-Time WAF**: Structured rule engine for blocking SQli, XSS, and other L7 attacks.

@@ -7,7 +7,8 @@ import (
 )
 
 type Config struct {
-	ListenPort       int          `json:"listen_port"`
+	ListenPort       int          `json:"listen_port"` // Legacy support
+	ListenPorts      []int        `json:"listen_ports"`
 	UpstreamAddr     string       `json:"upstream_addr"`
 	L3Blacklist      []string     `json:"l3_blacklist"`
 	L4ConnLimit      int          `json:"l4_conn_limit"`
@@ -37,9 +38,16 @@ func LoadConfig(path string) (*Config, error) {
 		file.Close()
 	}
 
+	// Handle port synchronization
+	if len(cfg.ListenPorts) == 0 && cfg.ListenPort != 0 {
+		cfg.ListenPorts = []int{cfg.ListenPort}
+	}
+
 	// Override with ENV variables if present
 	if val := os.Getenv("AEGISEDGE_PORT"); val != "" {
-		fmt.Sscanf(val, "%d", &cfg.ListenPort)
+		var p int
+		fmt.Sscanf(val, "%d", &p)
+		cfg.ListenPorts = append(cfg.ListenPorts, p)
 	}
 	if val := os.Getenv("AEGISEDGE_UPSTREAM"); val != "" {
 		cfg.UpstreamAddr = val
@@ -52,8 +60,8 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// Default values if nothing exists
-	if cfg.ListenPort == 0 {
-		cfg.ListenPort = 8080
+	if len(cfg.ListenPorts) == 0 {
+		cfg.ListenPorts = []int{8080}
 	}
 	if cfg.UpstreamAddr == "" {
 		cfg.UpstreamAddr = "http://localhost:3000"

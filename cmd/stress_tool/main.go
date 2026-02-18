@@ -4,9 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
+
+type result struct {
+	status  int
+	latency time.Duration
+}
 
 func main() {
 	target := flag.String("target", "http://localhost:8080", "Target URL to test")
@@ -15,9 +21,14 @@ func main() {
 	mode := flag.String("mode", "clean", "Test mode: clean, sqli, xss, cmd, challenge")
 	flag.Parse()
 
-	fmt.Printf("Starting stress test: target=%s, c=%d, n=%d, mode=%s\n", *target, *concurrency, *requests, *mode)
+	fmt.Printf("Starting AegisEdge Stress Test\n")
+	fmt.Printf("Targets:     %s\n", *target)
+	fmt.Printf("Concurrency: %d routines\n", *concurrency)
+	fmt.Printf("Requests:    %d total\n", *requests)
+	fmt.Printf("Mode:         %s\n", *mode)
+	fmt.Printf("----------------------------------\n")
 
-	results := make(chan int, *requests)
+	results := make(chan result, *requests)
 	var wg sync.WaitGroup
 
 	reqPerRoutine := *requests / *concurrency
@@ -29,7 +40,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			client := &http.Client{
-				Timeout: 5 * time.Second,
+				Timeout: 10 * time.Second,
 			}
 			for j := 0; j < reqPerRoutine; j++ {
 				url := *target
@@ -44,12 +55,15 @@ func main() {
 					url += "?challenge=1"
 				}
 
+				reqStart := time.Now()
 				resp, err := client.Get(url)
+				duration := time.Since(reqStart)
+
 				if err != nil {
-					results <- 0
+					results <- result{status: 0, latency: duration}
 					continue
 				}
-				results <- resp.StatusCode
+				results <- result{status: resp.StatusCode, latency: duration}
 				resp.Body.Close()
 			}
 		}()
@@ -58,30 +72,59 @@ func main() {
 	wg.Wait()
 	close(results)
 
-	duration := time.Since(startTime)
+	totalDuration := time.Since(startTime)
 	
-	stats := make(map[int]int)
-	total := 0
-	for status := range results {
-		stats[status]++
-		total++
+	var latencies []time.Duration
+	statusCodes := make(map[int]int)
+	var totalLatency time.Duration
+
+	for res := range results {
+		statusCodes[res.status]++
+		latencies = append(latencies, res.latency)
+		totalLatency += res.latency
 	}
 
-	fmt.Printf("\n--- Results ---\n")
-	fmt.Printf("Total Requests: %d\n", total)
-	fmt.Printf("Time Taken:     %v\n", duration)
-	fmt.Printf("Requests/sec:   %.2f\n", float64(total)/duration.Seconds())
-	fmt.Printf("\nStatus Codes:\n")
-	for code, count := range stats {
-		label := ""
-		switch code {
-		case 200: label = "OK"
-		case 400: label = "Bad Request (Blocked by WAF)"
-		case 403: label = "Forbidden (Blocked by L3/GeoIP)"
-		case 429: label = "Too Many Requests (Blocked by L7)"
-		case 503: label = "Service Unavailable (Challenge/Tarpit)"
-		case 0: label = "Connection Error"
-		}
-		fmt.Printf("  %d [%s]: %d\n", code, label, count)
+	sort.Slice(latencies, func(i, j int) bool {
+		return latencies[i] < latencies[j]
+	})
+
+	totalReqs := len(latencies)
+	if totalReqs == 0 {
+		fmt.Println("No requests completed.")
+		return
 	}
+
+	avgLatency := totalLatency / time.Duration(totalReqs)
+	p50 := latencies[int(float64(totalReqs)*0.5)]
+	p90 := latencies[int(float64(totalReqs)*0.9)]
+	p95 := latencies[int(float64(totalReqs)*0.95)]
+	p99 := latencies[int(float64(totalReqs)*0.99)]
+
+	fmt.Printf("\n--- Throughput & Timing ---\n")
+	fmt.Printf("Total Time:     %v\n", totalDuration)
+	fmt.Printf("Requests/sec:   %.2f\n", float64(totalReqs)/totalDuration.Seconds())
+	fmt.Printf("Avg Latency:    %v\n", avgLatency)
+	fmt.Printf("Min Latency:    %v\n", latencies[0])
+	fmt.Printf("Max Latency:    %v\n", latencies[totalReqs-1])
+
+	fmt.Printf("\n--- Latency Percentiles ---\n")
+	fmt.Printf("  p50: %v\n", p50)
+	fmt.Printf("  p90: %v\n", p90)
+	fmt.Printf("  p95: %v\n", p95)
+	fmt.Printf("  p99: %v\n", p99)
+
+	fmt.Printf("\n--- Mitigation Summary ---\n")
+	for code, count := range statusCodes {
+		label := "Unknown"
+		switch code {
+		case 200: label = "Legitimate (Allowed)"
+		case 400: label = "Blocked (WAF Policy)"
+		case 403: label = "Blocked (L3/GeoIP/Anomaly)"
+		case 429: label = "Shedded (L7 Rate Limit)"
+		case 503: label = "Challenge (Tarpit Mode)"
+		case 0:   label = "Connection Dropped"
+		}
+		fmt.Printf("  [%d] %-25s : %d\n", code, label, count)
+	}
+	fmt.Printf("----------------------------------\n")
 }

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"sync"
 
 	"aegisedge/filter"
 	"aegisedge/logger"
@@ -33,7 +34,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("Starting AegisEdge", "listen_port", cfg.ListenPort, "upstream", cfg.UpstreamAddr)
+	logger.Info("Starting AegisEdge", "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
 
 	// Initialize Storage (Local with Redis upgrade)
 	var activeStore store.Storer = store.NewLocalStore()
@@ -67,8 +68,9 @@ func main() {
 		})
 	}
 
-	// Orchestration check
+	// Orchestration check & OS Hardening
 	filter.CheckAnsibleThresholds()
+	filter.HardenOS()
 
 	// Initialize Proxy
 	p, err := proxy.NewReverseProxy(cfg.UpstreamAddr)
@@ -148,35 +150,51 @@ func main() {
 		http.ListenAndServe(":9091", mux)
 	}()
 
-	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.ListenPort),
-		Handler:           stack,
-		ReadHeaderTimeout: 2 * time.Second, // Kill Slowloris attacks early
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	// Initialize Servers for all configured ports
+	var servers []*http.Server
+	for _, port := range cfg.ListenPorts {
+		srv := &http.Server{
+			Addr:              fmt.Sprintf(":%d", port),
+			Handler:           stack,
+			ReadHeaderTimeout: 2 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		servers = append(servers, srv)
 	}
 
 	// Graceful shutdown logic
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("Server failed", "err", err)
-			os.Exit(1)
-		}
-	}()
+	for _, srv := range servers {
+		go func(s *http.Server) {
+			logger.Info("Proxy engine active", "addr", s.Addr)
+			if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("Server failed", "addr", s.Addr, "err", err)
+				os.Exit(1)
+			}
+		}(srv)
+	}
 
 	<-done
-	logger.Info("Server stopping...")
+	logger.Info("AegisEdge stopping...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("Shutdown failed", "err", err)
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(s *http.Server) {
+			defer wg.Done()
+			if err := s.Shutdown(ctx); err != nil {
+				logger.Error("Shutdown failed", "addr", s.Addr, "err", err)
+			}
+		}(srv)
 	}
+	wg.Wait()
 
-	logger.Info("Server stopped gracefully")
+	logger.Info("All servers stopped gracefully")
 }
