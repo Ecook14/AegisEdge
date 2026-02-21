@@ -1,5 +1,15 @@
 # AegisEdge Usage Guide
 
+## ⚡ Rapid Deployment (The 60-Second Shield)
+
+To instantly protect any server (WHM, Plesk, or Baremetal) without manual configuration:
+
+```bash
+sudo bash scripts/takeover.sh
+```
+
+---
+
 This guide provides instructions on how to run, test, and manage the AegisEdge security proxy.
 
 ### 0. Start the Demo Upstream (Optional)
