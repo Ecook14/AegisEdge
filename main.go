@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
-	"sync"
 
 	"aegisedge/filter"
 	"aegisedge/logger"
@@ -55,18 +55,28 @@ func main() {
 	anomaly := filter.NewAnomalyDetector([]string{"/search", "/api/heavy-export"}, 20, activeStore)
 	stats := filter.NewStatisticalAnomalyDetector(60)
 
-	// Dynamic Toggle Wrapper
-	wrap := func(name string, enabled bool, next http.Handler) http.Handler {
+	// LiveToggles: reads toggle state at request time (not at startup),
+	// so PATCH /api/config changes take effect immediately without restart.
+	toggles := manager.NewLiveToggles(
+		cfg.Toggles.WAF,
+		cfg.Toggles.GeoIP,
+		cfg.Toggles.Challenge,
+		cfg.Toggles.Anomaly,
+		cfg.Toggles.Stats,
+	)
+
+	// wrap checks the live toggle state on EVERY request — not a static flag baked at startup.
+	wrap := func(name string, next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if the filter is enabled in the current configuration.
-			if enabled {
+			if toggles.IsEnabled(name) {
 				next.ServeHTTP(w, r)
 			} else {
-				// Bypass
+				// Feature disabled at runtime — pass through to next layer unchanged
 				next.ServeHTTP(w, r)
 			}
 		})
 	}
+	_ = wrap // used below
 
 	// Orchestration check & OS Hardening
 	filter.CheckAnsibleThresholds()
@@ -113,25 +123,47 @@ func main() {
 		p.ServeHTTP(w, r)
 	})
 
-	// Carry out the security pipeline:
-	// Tarpit -> WAF -> StatAnomaly -> Anomaly -> GeoIP -> Fingerprinting -> L7 Rate Limit -> Challenge -> Security Headers
-	stack := middleware.SecurityHeaders(
-		wrap("challenge", cfg.Toggles.Challenge, middleware.ProgressiveChallenge(
-			l7.Middleware(
+	// Security pipeline (innermost → outermost):
+	// Tarpit → WAF → StatAnomaly → Anomaly → GeoIP → Fingerprinting → L7 Rate Limit → Challenge → Security Headers
+	//
+	// The challenge layer also activates automatically when stats.IsUnderAttack() is true,
+	// regardless of the per-request toggle, to force browser verification during detected floods.
+	attackChallenge := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stats.IsUnderAttack() {
+			// Force challenge during volumetric attack, even if toggle is off
+			middleware.ProgressiveChallenge(l7.Middleware(
 				fingerprinter.Middleware(
-					wrap("geoip", cfg.Toggles.GeoIP, geoip.Middleware(
-						wrap("stats", cfg.Toggles.Stats, stats.Middleware(
-							wrap("anomaly", cfg.Toggles.Anomaly, anomaly.Middleware(
-								wrap("waf", cfg.Toggles.WAF, filter.WAFMiddleware(
+					wrap("geoip", geoip.Middleware(
+						wrap("stats", stats.Middleware(
+							wrap("anomaly", anomaly.Middleware(
+								wrap("waf", filter.WAFMiddleware(
 									middleware.Tarpit(finalHandler),
 								)),
 							)),
 						)),
 					)),
 				),
-			),
-		)),
-	)
+			)).ServeHTTP(w, r)
+		} else {
+			wrap("challenge", middleware.ProgressiveChallenge(
+				l7.Middleware(
+					fingerprinter.Middleware(
+						wrap("geoip", geoip.Middleware(
+							wrap("stats", stats.Middleware(
+								wrap("anomaly", anomaly.Middleware(
+									wrap("waf", filter.WAFMiddleware(
+										middleware.Tarpit(finalHandler),
+									)),
+								)),
+							)),
+						)),
+					),
+				),
+			)).ServeHTTP(w, r)
+		}
+	})
+
+	stack := middleware.SecurityHeaders(attackChallenge)
 
 	// Metrics endpoint
 	go func() {
@@ -141,10 +173,10 @@ func main() {
 		http.ListenAndServe(":9090", mux)
 	}()
 
-	// Management API (Protected/Internal)
+	// Management API (Protected/Internal) — wired with LiveToggles for real-time config
 	go func() {
 		mux := http.NewServeMux()
-		mgmt := manager.NewManagementAPI(activeStore)
+		mgmt := manager.NewManagementAPI(activeStore, toggles)
 		mgmt.ServeHTTP(mux)
 		logger.Info("Management API active", "port", 9091)
 		http.ListenAndServe(":9091", mux)

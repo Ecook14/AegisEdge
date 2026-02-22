@@ -3,23 +3,93 @@ package manager
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"aegisedge/logger"
 	"aegisedge/store"
 )
 
+// LiveToggles holds the runtime feature flag state, safe for concurrent reads/writes.
+type LiveToggles struct {
+	mu       sync.RWMutex
+	WAF      bool
+	GeoIP    bool
+	Challenge bool
+	Anomaly  bool
+	Stats    bool
+}
+
+func NewLiveToggles(waf, geoip, challenge, anomaly, stats bool) *LiveToggles {
+	return &LiveToggles{
+		WAF:      waf,
+		GeoIP:    geoip,
+		Challenge: challenge,
+		Anomaly:  anomaly,
+		Stats:    stats,
+	}
+}
+
+func (t *LiveToggles) IsEnabled(feature string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	switch feature {
+	case "waf":
+		return t.WAF
+	case "geoip":
+		return t.GeoIP
+	case "challenge":
+		return t.Challenge
+	case "anomaly":
+		return t.Anomaly
+	case "stats":
+		return t.Stats
+	}
+	return true
+}
+
+func (t *LiveToggles) Set(feature string, enabled bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch feature {
+	case "waf":
+		t.WAF = enabled
+	case "geoip":
+		t.GeoIP = enabled
+	case "challenge":
+		t.Challenge = enabled
+	case "anomaly":
+		t.Anomaly = enabled
+	case "stats":
+		t.Stats = enabled
+	}
+}
+
+func (t *LiveToggles) Snapshot() map[string]bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return map[string]bool{
+		"waf":       t.WAF,
+		"geoip":     t.GeoIP,
+		"challenge": t.Challenge,
+		"anomaly":   t.Anomaly,
+		"stats":     t.Stats,
+	}
+}
+
+// ManagementAPI provides runtime control over AegisEdge state.
 type ManagementAPI struct {
-	Store store.Storer
+	Store   store.Storer
+	Toggles *LiveToggles
 }
 
 type BlockRequest struct {
 	IP       string `json:"ip"`
-	Duration string `json:"duration"` // e.g. "1h", "permanent"
+	Duration string `json:"duration"` // e.g. "1h", "30m", "permanent"
 }
 
-func NewManagementAPI(s store.Storer) *ManagementAPI {
-	return &ManagementAPI{Store: s}
+func NewManagementAPI(s store.Storer, toggles *LiveToggles) *ManagementAPI {
+	return &ManagementAPI{Store: s, Toggles: toggles}
 }
 
 func (api *ManagementAPI) ServeHTTP(mux *http.ServeMux) {
@@ -40,15 +110,16 @@ func (api *ManagementAPI) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process toggles
-	// Process feature toggle updates.
-	for k, v := range updates {
-		logger.Info("Feature toggle updated", "feature", k, "state", v)
-		// Propagate changes to the active configuration registry.
+	for feature, enabled := range updates {
+		api.Toggles.Set(feature, enabled)
+		logger.Info("Feature toggle applied live", "feature", feature, "enabled", enabled)
 	}
 
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"message": "Config updated successfully"})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":  "Toggles applied (live, no restart needed)",
+		"toggles":  api.Toggles.Snapshot(),
+	})
 }
 
 func (api *ManagementAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -58,9 +129,10 @@ func (api *ManagementAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{
-		"status": "active",
+		"status":        "active",
 		"active_blocks": blocks,
-		"timestamp": time.Now(),
+		"toggles":       api.Toggles.Snapshot(),
+		"timestamp":     time.Now(),
 	})
 }
 
@@ -75,14 +147,14 @@ func (api *ManagementAPI) handleBlock(w http.ResponseWriter, r *http.Request) {
 		dur := 24 * time.Hour // Default
 		blockType := "temp"
 		if req.Duration == "permanent" {
-			dur = 0 // Redis 0 means no expire in some contexts, but we use a large value
-			dur = 10 * 365 * 24 * time.Hour 
+			dur = 10 * 365 * 24 * time.Hour
 			blockType = "hard"
 		} else if d, err := time.ParseDuration(req.Duration); err == nil {
 			dur = d
 		}
 
 		api.Store.Block(req.IP, dur, blockType)
+		logger.Info("Manual IP block applied", "ip", req.IP, "duration", dur, "type", blockType)
 		w.WriteHeader(http.StatusCreated)
 		return
 	}

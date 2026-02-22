@@ -15,7 +15,7 @@ import (
 
 const (
 	ChallengeCookieName = "ae_clearance"
-	CookieExpiry      = 3600 // 1 hour
+	CookieExpiry        = 3600 // 1 hour in seconds
 )
 
 var secretKey = []byte(getSecret())
@@ -34,48 +34,94 @@ func generateSignature(val string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// ProgressiveChallenge automatically challenges every request that doesn't carry
+// a valid ae_clearance cookie. Legitimate browsers pass the 2-second JS challenge
+// and receive a signed cookie; subsequent requests bypass the challenge entirely.
+// Headless HTTP clients with no JS engine are turned away at 503.
 func ProgressiveChallenge(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. Check if user already has a valid clearance cookie
+		// 1. Check if the client already holds a valid clearance cookie.
 		cookie, err := r.Cookie(ChallengeCookieName)
 		if err == nil && verifyCookie(cookie.Value) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// 2. Identify if request should be challenged
-		if r.URL.Query().Get("challenge") == "1" {
-			logger.Info("Serving JS challenge", "remote_addr", r.RemoteAddr)
-			serveChallenge(w)
-			return
+		// 2. If the client is submitting the solved challenge cookie via query param
+		//    (posted back after the JS runs), set the cookie and redirect cleanly.
+		if token := r.URL.Query().Get("ae_token"); token != "" {
+			if verifyCookie(token) {
+				http.SetCookie(w, &http.Cookie{
+					Name:     ChallengeCookieName,
+					Value:    token,
+					Path:     "/",
+					MaxAge:   CookieExpiry,
+					SameSite: http.SameSiteLaxMode,
+					HttpOnly: true,
+				})
+				// Strip the token from the URL and redirect to the clean path
+				target := r.URL.Path
+				if r.URL.RawQuery != "" {
+					q := r.URL.Query()
+					q.Del("ae_token")
+					if len(q) > 0 {
+						target += "?" + q.Encode()
+					}
+				}
+				http.Redirect(w, r, target, http.StatusFound)
+				return
+			}
 		}
 
-		next.ServeHTTP(w, r)
+		// 3. All other requests get the JS challenge page.
+		logger.Info("Serving JS challenge (no valid clearance)", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
+		serveChallenge(w, r)
 	})
 }
 
-func serveChallenge(w http.ResponseWriter) {
+func serveChallenge(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	
+
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	sig := generateSignature(ts)
-	cookieVal := fmt.Sprintf("%s.%s", ts, sig)
+	token := fmt.Sprintf("%s.%s", ts, sig)
 
-	html := `
-	<html>
-		<head><title>AegisEdge Protection</title></head>
-		<body>
-			<h1>Checking your browser...</h1>
-			<p>Please wait while we verify you are human.</p>
-			<script>
-				setTimeout(function() {
-					document.cookie = "ae_clearance=` + cookieVal + `; Path=/; Max-Age=3600; SameSite=Lax";
-					location.reload();
-				}, 2000);
-			</script>
-		</body>
-	</html>`
+	// The JS sets the token as a query param and reloads so the server can
+	// set it as an HttpOnly cookie (JS can't set HttpOnly cookies itself).
+	redirectURL := r.URL.Path + "?ae_token=" + token
+	if r.URL.RawQuery != "" {
+		q := r.URL.Query()
+		q.Del("ae_token")
+		if encoded := q.Encode(); encoded != "" {
+			redirectURL += "&" + encoded
+		}
+	}
+
+	html := `<!DOCTYPE html>
+<html>
+  <head>
+    <title>AegisEdge — Checking your browser</title>
+    <style>
+      body { font-family: sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; background:#0d1117; color:#cdd9e5; }
+      .box { text-align:center; }
+      .spinner { width:40px; height:40px; border:4px solid #30363d; border-top-color:#58a6ff; border-radius:50%; animation:spin 0.8s linear infinite; margin:1rem auto; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <div class="spinner"></div>
+      <h2>Checking your browser&hellip;</h2>
+      <p>AegisEdge Security &mdash; one moment please.</p>
+      <script>
+        setTimeout(function() {
+          window.location.href = "` + redirectURL + `";
+        }, 2000);
+      </script>
+    </div>
+  </body>
+</html>`
 	fmt.Fprint(w, html)
 }
 
@@ -86,19 +132,19 @@ func verifyCookie(val string) bool {
 	}
 
 	tsStr, providedSig := parts[0], parts[1]
-	
-	// Validate signature
+
+	// Constant-time HMAC comparison
 	expectedSig := generateSignature(tsStr)
 	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
-		logger.Warn("Invalid cookie signature detected", "value", val)
+		logger.Warn("Invalid challenge cookie signature", "value", val)
 		return false
 	}
 
-	// Validate expiry
+	// Expiry check
 	var ts int64
 	fmt.Sscanf(tsStr, "%d", &ts)
 	if time.Now().Unix() > ts+CookieExpiry {
-		logger.Warn("Expired cookie detected", "timestamp", ts)
+		logger.Warn("Expired challenge cookie", "timestamp", ts)
 		return false
 	}
 
