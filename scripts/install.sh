@@ -9,8 +9,8 @@ fi
 
 echo "Installing AegisEdge as a system service..."
 
-# 1. Build the binary
-go build -o aegisedge main.go config.go
+# 1. Build the binary (Static compilation to avoid GLIBC issues)
+CGO_ENABLED=0 go build -ldflags="-s -w" -o aegisedge .
 
 # 2. Move to standard path
 mkdir -p /opt/aegisedge
