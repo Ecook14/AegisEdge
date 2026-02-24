@@ -11,4 +11,6 @@ type Storer interface {
 	Block(key string, expiration time.Duration, blockType string)
 	Unblock(key string) error
 	ListBlocks() (map[string]string, error)
+	Get(key string) (string, error)
+	Set(key string, val string, expiration time.Duration) error
 }

@@ -57,8 +57,9 @@ else
 fi
 
 # 4. Binary & Service Setup
-echo "[*] Compiling AegisEdge binary (Static)..."
-CGO_ENABLED=0 go build -o /opt/aegisedge/aegisedge main.go config.go 2>/dev/null || (mkdir -p /opt/aegisedge && CGO_ENABLED=0 go build -o /opt/aegisedge/aegisedge main.go config.go)
+echo "[*] Compiling AegisEdge binary (Static/Portable)..."
+mkdir -p /opt/aegisedge
+CGO_ENABLED=0 go build -ldflags="-s -w" -o /opt/aegisedge/aegisedge . || exit 1
 
 # Write persistent .env
 cat <<EOF > /opt/aegisedge/.env

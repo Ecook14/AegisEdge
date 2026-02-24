@@ -2,12 +2,12 @@ package filter
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"time"
 
 	"aegisedge/logger"
 	"aegisedge/store"
+	"aegisedge/util"
 )
 
 // AnomalyDetector tracks request patterns to identify stealthy attacks.
@@ -31,7 +31,7 @@ func NewAnomalyDetector(heavyURLs []string, threshold int, s store.Storer) *Anom
 
 func (d *AnomalyDetector) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		host := util.GetRealIP(r)
 		path := r.URL.Path
 
 		// Unified Anomaly Detection

@@ -1,6 +1,8 @@
 package filter
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"regexp"
 
@@ -23,34 +25,63 @@ var (
 
 func WAFMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. Scan Query Parameters and Path
 		query := r.URL.RawQuery
-		
-		if sqliRegex.MatchString(query) {
-			logger.Warn("Blocked SQLi attempt", "remote_addr", r.RemoteAddr, "query", query)
-			BlockedRequests.WithLabelValues("L7", "sqli").Inc()
-			http.Error(w, "Malicious request detected", http.StatusBadRequest)
-			return
+		path := r.URL.Path
+
+		// 2. Scan Body (POST/PUT only, capped at 4KB to prevent memory exhaustion)
+		var bodySample string
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			buf := make([]byte, 4096)
+			n, _ := io.ReadFull(r.Body, buf)
+			if n > 0 {
+				bodySample = string(buf[:n])
+				// Restore body so proxy can still read it
+				r.Body = struct {
+					io.Reader
+					io.Closer
+				}{
+					Reader: io.MultiReader(bytes.NewReader(buf[:n]), r.Body),
+					Closer: r.Body,
+				}
+			}
 		}
 
-		if xssRegex.MatchString(query) {
-			logger.Warn("Blocked XSS attempt", "remote_addr", r.RemoteAddr, "query", query)
-			BlockedRequests.WithLabelValues("L7", "xss").Inc()
-			http.Error(w, "Malicious request detected", http.StatusBadRequest)
-			return
-		}
+		// Combined check
+		payloads := []string{query, path, bodySample}
 
-		if cmdInjRegex.MatchString(query) {
-			logger.Warn("Blocked Command Injection attempt", "remote_addr", r.RemoteAddr, "query", query)
-			BlockedRequests.WithLabelValues("L7", "cmd_injection").Inc()
-			http.Error(w, "Malicious request detected", http.StatusBadRequest)
-			return
-		}
+		for _, p := range payloads {
+			if p == "" {
+				continue
+			}
 
-		if traversal.MatchString(query) || traversal.MatchString(r.URL.Path) {
-			logger.Warn("Blocked path traversal attempt", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
-			BlockedRequests.WithLabelValues("L7", "traversal").Inc()
-			http.Error(w, "Malicious request detected", http.StatusBadRequest)
-			return
+			if sqliRegex.MatchString(p) {
+				logger.Warn("Blocked SQLi attempt", "remote_addr", r.RemoteAddr, "payload", p)
+				BlockedRequests.WithLabelValues("L7", "sqli").Inc()
+				http.Error(w, "Malicious request detected", http.StatusBadRequest)
+				return
+			}
+
+			if xssRegex.MatchString(p) {
+				logger.Warn("Blocked XSS attempt", "remote_addr", r.RemoteAddr, "payload", p)
+				BlockedRequests.WithLabelValues("L7", "xss").Inc()
+				http.Error(w, "Malicious request detected", http.StatusBadRequest)
+				return
+			}
+
+			if cmdInjRegex.MatchString(p) {
+				logger.Warn("Blocked Command Injection attempt", "remote_addr", r.RemoteAddr, "payload", p)
+				BlockedRequests.WithLabelValues("L7", "cmd_injection").Inc()
+				http.Error(w, "Malicious request detected", http.StatusBadRequest)
+				return
+			}
+
+			if traversal.MatchString(p) {
+				logger.Warn("Blocked path traversal attempt", "remote_addr", r.RemoteAddr, "payload", p)
+				BlockedRequests.WithLabelValues("L7", "traversal").Inc()
+				http.Error(w, "Malicious request detected", http.StatusBadRequest)
+				return
+			}
 		}
 
 		next.ServeHTTP(w, r)

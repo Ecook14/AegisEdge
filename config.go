@@ -2,8 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"os"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -34,9 +35,20 @@ type FeatureFlags struct {
 }
 
 func LoadConfig(path string) (*Config, error) {
-	var cfg Config
+	// 1. Set System Defaults
+	cfg := Config{
+		UpstreamAddr: "http://localhost:3000",
+		ListenPorts:  []int{8080},
+		Toggles: FeatureFlags{
+			WAF:       true,
+			GeoIP:     true,
+			Challenge: true,
+			Anomaly:   true,
+			Stats:     true,
+		},
+	}
 	
-	// Try loading from file first
+	// 2. Load from file (Overrides Defaults)
 	file, err := os.Open(path)
 	if err == nil {
 		decoder := json.NewDecoder(file)
@@ -44,12 +56,12 @@ func LoadConfig(path string) (*Config, error) {
 		file.Close()
 	}
 
-	// Handle port synchronization
+	// Handle legacy port synchronization
 	if len(cfg.ListenPorts) == 0 && cfg.ListenPort != 0 {
 		cfg.ListenPorts = []int{cfg.ListenPort}
 	}
 
-	// Override with ENV variables if present
+	// 3. Load from Environment (Overrides File)
 	if val := os.Getenv("AEGISEDGE_PORT"); val != "" {
 		var p int
 		fmt.Sscanf(val, "%d", &p)
@@ -96,21 +108,15 @@ func LoadConfig(path string) (*Config, error) {
 	if val := os.Getenv("AEGISEDGE_L7_RATE_LIMIT"); val != "" {
 		fmt.Sscanf(val, "%f", &cfg.L7RateLimit)
 	}
-
-	// Default values if nothing exists
-	if len(cfg.ListenPorts) == 0 {
-		cfg.ListenPorts = []int{8080}
+	if val := os.Getenv("AEGISEDGE_L7_BURST_LIMIT"); val != "" {
+		fmt.Sscanf(val, "%d", &cfg.L7BurstLimit)
 	}
-	if cfg.UpstreamAddr == "" {
-		cfg.UpstreamAddr = "http://localhost:3000"
+	if val := os.Getenv("AEGISEDGE_GEOIP_DB"); val != "" {
+		cfg.GeoIPDBPath = val
 	}
-
-	// Default Toggles to true
-	cfg.Toggles.WAF = true
-	cfg.Toggles.GeoIP = true
-	cfg.Toggles.Challenge = true
-	cfg.Toggles.Anomaly = true
-	cfg.Toggles.Stats = true
+	if val := os.Getenv("AEGISEDGE_BLOCKED_COUNTRIES"); val != "" {
+		cfg.BlockedCountries = strings.Split(val, ",")
+	}
 
 	return &cfg, nil
 }
@@ -123,27 +129,37 @@ func (c *Config) DiscoverCerts() (string, string) {
 
 	// Priority locations for different environments (WHM, Plesk, Baremetal, etc.)
 	searches := []struct {
-		cert string
-		key  string
+		certPattern string
+		keyPattern  string
 	}{
 		{"certs/cert.pem", "certs/key.pem"},
-		{"/etc/letsencrypt/live/*/fullchain.pem", "/etc/letsencrypt/live/*/privkey.pem"}, // Wildcard support would need glob
+		{"/etc/letsencrypt/live/*/fullchain.pem", "/etc/letsencrypt/live/*/privkey.pem"},
 		{"/etc/letsencrypt/open/fullchain.pem", "/etc/letsencrypt/open/privkey.pem"},
 		{"/etc/ssl/certs/aegis.crt", "/etc/ssl/private/aegis.key"},
-		// RHEL / CentOS
 		{"/etc/pki/tls/certs/localhost.crt", "/etc/pki/tls/private/localhost.key"},
-		// cPanel / WHM (common locations)
+		// cPanel / WHM
 		{"/var/cpanel/ssl/installed/certs/*.crt", "/var/cpanel/ssl/installed/keys/*.key"},
 		// Plesk
 		{"/usr/local/psa/var/certificates/*", "/usr/local/psa/var/certificates/*"},
 	}
 
 	for _, s := range searches {
-		// Note: Actual implementation would use filepath.Glob for wildcards
-		// For now, checking direct standard paths
-		if _, err := os.Stat(s.cert); err == nil {
-			if _, err := os.Stat(s.key); err == nil {
-				return s.cert, s.key
+		certs, _ := filepath.Glob(s.certPattern)
+		if len(certs) == 0 {
+			continue
+		}
+
+		for _, cert := range certs {
+			// For each cert found, try to find a matching key
+			// If the pattern itself was a direct path, keys will be searched 
+			// the same way.
+			keys, _ := filepath.Glob(s.keyPattern)
+			for _, key := range keys {
+				if _, err := os.Stat(cert); err == nil {
+					if _, err := os.Stat(key); err == nil {
+						return cert, key
+					}
+				}
 			}
 		}
 	}

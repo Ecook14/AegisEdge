@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"aegisedge/filter"
 	"aegisedge/logger"
 )
 
@@ -28,36 +29,37 @@ func getSecret() string {
 	return s
 }
 
-func generateSignature(val string) string {
+func generateSignature(val, ip string) string {
 	h := hmac.New(sha256.New, secretKey)
-	h.Write([]byte(val))
+	// Bind to both the value and the client IP for enterprise-grade security
+	h.Write([]byte(val + ":" + ip))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// ProgressiveChallenge automatically challenges every request that doesn't carry
-// a valid ae_clearance cookie. Legitimate browsers pass the 2-second JS challenge
-// and receive a signed cookie; subsequent requests bypass the challenge entirely.
-// Headless HTTP clients with no JS engine are turned away at 503.
-func ProgressiveChallenge(next http.Handler) http.Handler {
+func ProgressiveChallenge(next http.Handler, rep *filter.ReputationManager) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. Check if the client already holds a valid clearance cookie.
+		host := GetRealIP(r)
+
 		cookie, err := r.Cookie(ChallengeCookieName)
-		if err == nil && verifyCookie(cookie.Value) {
+		if err == nil && verifyCookie(cookie.Value, host) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// 2. If the client is submitting the solved challenge cookie via query param
-		//    (posted back after the JS runs), set the cookie and redirect cleanly.
 		if token := r.URL.Query().Get("ae_token"); token != "" {
-			if verifyCookie(token) {
+			if verifyCookie(token, host) {
+				// Reward the IP for solving the challenge
+				if rep != nil {
+					rep.Reward(host)
+				}
 				http.SetCookie(w, &http.Cookie{
 					Name:     ChallengeCookieName,
 					Value:    token,
 					Path:     "/",
 					MaxAge:   CookieExpiry,
-					SameSite: http.SameSiteLaxMode,
+					SameSite: http.SameSiteStrictMode,
 					HttpOnly: true,
+					Secure:   true, // Must not be sent over plain HTTP
 				})
 				// Strip the token from the URL and redirect to the clean path
 				target := r.URL.Path
@@ -75,16 +77,16 @@ func ProgressiveChallenge(next http.Handler) http.Handler {
 
 		// 3. All other requests get the JS challenge page.
 		logger.Info("Serving JS challenge (no valid clearance)", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
-		serveChallenge(w, r)
+		serveChallenge(w, r, host)
 	})
 }
 
-func serveChallenge(w http.ResponseWriter, r *http.Request) {
+func serveChallenge(w http.ResponseWriter, r *http.Request, ip string) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusServiceUnavailable)
 
 	ts := fmt.Sprintf("%d", time.Now().Unix())
-	sig := generateSignature(ts)
+	sig := generateSignature(ts, ip)
 	token := fmt.Sprintf("%s.%s", ts, sig)
 
 	// The JS sets the token as a query param and reloads so the server can
@@ -125,7 +127,7 @@ func serveChallenge(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, html)
 }
 
-func verifyCookie(val string) bool {
+func verifyCookie(val, ip string) bool {
 	parts := strings.Split(val, ".")
 	if len(parts) != 2 {
 		return false
@@ -134,9 +136,9 @@ func verifyCookie(val string) bool {
 	tsStr, providedSig := parts[0], parts[1]
 
 	// Constant-time HMAC comparison
-	expectedSig := generateSignature(tsStr)
+	expectedSig := generateSignature(tsStr, ip)
 	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
-		logger.Warn("Invalid challenge cookie signature", "value", val)
+		logger.Warn("Invalid challenge cookie signature or IP mismatch", "value", val, "client_ip", ip)
 		return false
 	}
 

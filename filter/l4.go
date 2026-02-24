@@ -1,10 +1,10 @@
 package filter
 
 import (
-	"log"
 	"net"
 	"time"
 
+	"aegisedge/logger"
 	"aegisedge/store"
 )
 
@@ -28,12 +28,12 @@ func (f *L4Filter) AllowConnection(addr string) bool {
 
 	count, err := f.store.Increment(key, f.IdleTimeout)
 	if err != nil {
-		log.Printf("[L4] Store error: %v", err)
+		logger.Error("L4 store error (fail open)", "err", err, "ip", host)
 		return true // Fail open
 	}
 
 	if int(count) > f.MaxConnPerIP {
-		log.Printf("[L4] Blocked IP %s (too many connections: %d)", host, count)
+		logger.Warn("L4 connection limit exceeded", "ip", host, "count", count, "limit", f.MaxConnPerIP)
 		return false
 	}
 	return true
@@ -45,7 +45,7 @@ func (f *L4Filter) ReleaseConnection(addr string) {
 	
 	_, err := f.store.Decrement(key)
 	if err != nil {
-		log.Printf("[L4] Store decrement error: %v", err)
+		logger.Error("L4 store decrement error", "err", err, "ip", host)
 	}
 }
 

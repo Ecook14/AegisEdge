@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"aegisedge/logger"
+	"aegisedge/util"
 	"github.com/oschwald/geoip2-golang"
 )
 
@@ -32,7 +33,7 @@ func NewGeoIPFilter(dbPath string, blockedCountries []string) *GeoIPFilter {
 
 func (f *GeoIPFilter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		host := util.GetRealIP(r)
 		ip := net.ParseIP(host)
 		
 		if f.db != nil && ip != nil {

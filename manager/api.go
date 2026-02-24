@@ -8,6 +8,7 @@ import (
 
 	"aegisedge/logger"
 	"aegisedge/store"
+	utilpkg "aegisedge/util"
 )
 
 // LiveToggles holds the runtime feature flag state, safe for concurrent reads/writes.
@@ -79,8 +80,9 @@ func (t *LiveToggles) Snapshot() map[string]bool {
 
 // ManagementAPI provides runtime control over AegisEdge state.
 type ManagementAPI struct {
-	Store   store.Storer
-	Toggles *LiveToggles
+	Store        store.Storer
+	Toggles      *LiveToggles
+	ProxyWatcher *utilpkg.ProxyWatcher
 }
 
 type BlockRequest struct {
@@ -88,14 +90,18 @@ type BlockRequest struct {
 	Duration string `json:"duration"` // e.g. "1h", "30m", "permanent"
 }
 
-func NewManagementAPI(s store.Storer, toggles *LiveToggles) *ManagementAPI {
-	return &ManagementAPI{Store: s, Toggles: toggles}
+func NewManagementAPI(s store.Storer, toggles *LiveToggles, pw *utilpkg.ProxyWatcher) *ManagementAPI {
+	return &ManagementAPI{Store: s, Toggles: toggles, ProxyWatcher: pw}
 }
 
 func (api *ManagementAPI) ServeHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/api/status", api.handleStatus)
 	mux.HandleFunc("/api/block", api.handleBlock)
 	mux.HandleFunc("/api/config", api.handleConfig)
+	// Trusted proxy management — live, no restart required
+	mux.HandleFunc("/api/proxy/reload", api.handleProxyReload)
+	mux.HandleFunc("/api/proxy/add", api.handleProxyAdd)
+	mux.HandleFunc("/api/proxy/remove", api.handleProxyRemove)
 }
 
 func (api *ManagementAPI) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -176,3 +182,61 @@ func (api *ManagementAPI) handleBlock(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
+
+// handleProxyReload forces an immediate re-read of CSF/cPHulk/iptables.
+// POST /api/proxy/reload
+func (api *ManagementAPI) handleProxyReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if api.ProxyWatcher == nil {
+		http.Error(w, "ProxyWatcher not initialised", http.StatusServiceUnavailable)
+		return
+	}
+	api.ProxyWatcher.Reload()
+	logger.Info("Trusted proxy list reloaded via API")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
+}
+
+// handleProxyAdd adds a permanent manual IP/CIDR to the trusted list.
+// POST /api/proxy/add   body: {"entry": "1.2.3.4"} or {"entry": "10.0.0.0/8"}
+func (api *ManagementAPI) handleProxyAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Entry string `json:"entry"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Entry == "" {
+		http.Error(w, "body must be {\"entry\": \"<ip-or-cidr>\"}", http.StatusBadRequest)
+		return
+	}
+	api.ProxyWatcher.AddManual(body.Entry)
+	logger.Info("Trusted proxy entry added via API", "entry", body.Entry)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "added", "entry": body.Entry})
+}
+
+// handleProxyRemove removes a manual IP/CIDR from the trusted list.
+// DELETE /api/proxy/remove?entry=1.2.3.4
+func (api *ManagementAPI) handleProxyRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Use DELETE", http.StatusMethodNotAllowed)
+		return
+	}
+	entry := r.URL.Query().Get("entry")
+	if entry == "" {
+		http.Error(w, "?entry= required", http.StatusBadRequest)
+		return
+	}
+	api.ProxyWatcher.RemoveManual(entry)
+	logger.Info("Trusted proxy entry removed via API", "entry", entry)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "removed", "entry": entry})
+}
+
+// Ensure utilpkg is used (ProxyWatcher field references it).
+var _ *utilpkg.ProxyWatcher

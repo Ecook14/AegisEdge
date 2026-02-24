@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,12 +18,14 @@ import (
 	"aegisedge/middleware"
 	"aegisedge/proxy"
 	"aegisedge/store"
+	"aegisedge/util"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
+	logger.SetLevel(os.Getenv("AEGISEDGE_LOG_LEVEL"))
 	configPath := "config.json"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
@@ -46,6 +49,9 @@ func main() {
 		logger.Info("In-memory state initialized (Local fallback)")
 	}
 
+	// Initialize Reputation & Intelligence
+	rep := filter.NewReputationManager(activeStore)
+
 	// Initialize Filters
 	l3 := filter.NewL3Filter(cfg.L3Blacklist)
 	l4 := filter.NewL4Filter(cfg.L4ConnLimit, 5*time.Minute, activeStore)
@@ -65,18 +71,24 @@ func main() {
 		cfg.Toggles.Stats,
 	)
 
-	// wrap checks the live toggle state on EVERY request — not a static flag baked at startup.
-	wrap := func(name string, next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if toggles.IsEnabled(name) {
-				next.ServeHTTP(w, r)
-			} else {
-				// Feature disabled at runtime — pass through to next layer unchanged
-				next.ServeHTTP(w, r)
-			}
-		})
+	// wrapToggle applies a middleware layer with a live-switchable toggle.
+	// The middleware is pre-built at startup (wrapped and bypass), selected per request.
+	// This is the correct pattern: toggle changes via /api/config take effect on the NEXT request.
+	wrapToggle := func(name string, mw func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			wrapped := mw(next) // pre-build the actual middleware chain
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if toggles.IsEnabled(name) {
+					wrapped.ServeHTTP(w, r)
+				} else {
+					next.ServeHTTP(w, r) // bypass — skip this layer entirely
+				}
+			})
+		}
 	}
-	_ = wrap // used below
+
+	// activeConns is an atomic counter for real load-aware challenge gating.
+	var activeConns int64
 
 	// Orchestration check & OS Hardening
 	filter.CheckAnsibleThresholds()
@@ -89,10 +101,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Combined Handler
+	// finalHandler: L3/L4 gate + Prometheus metrics + upstream proxy
 	finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, _ := net.SplitHostPort(r.RemoteAddr)
-		
+		host := util.GetRealIP(r)
+
 		// Layer 3 (Centralized Block Check)
 		if activeStore.IsBlocked(host) {
 			filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
@@ -114,56 +126,57 @@ func main() {
 		}
 		defer l4.ReleaseConnection(r.RemoteAddr)
 
+		p.ServeHTTP(w, r)
+	})
+
+
+	// Build the inner security pipeline from inside out (innermost first).
+	// Each wrapToggle layer can be switched on/off live via /api/config.
+	inner := middleware.Tarpit(finalHandler, rep)
+	inner = wrapToggle("waf", filter.WAFMiddleware)(inner)
+	inner = wrapToggle("anomaly", anomaly.Middleware)(inner)
+	inner = wrapToggle("stats", stats.Middleware)(inner)
+	inner = wrapToggle("geoip", geoip.Middleware)(inner)
+	inner = fingerprinter.Middleware(inner)                  // Fingerprinting always active
+	inner = l7.Middleware(inner, rep)                        // Rate limiter + reputation
+
+	// challengeInner: progressively challenges all unauthenticated traffic.
+	// Builds the challenge around the inner pipeline once.
+	challengeInner := middleware.ProgressiveChallenge(inner, rep)
+
+	// attackChallenge: the outermost per-request decision gate.
+	// Force challenge when:  (a) Z-Score anomaly detected, or (b) real concurrent load > 200.
+	attackChallenge := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Outermost Load Tracking: Capture every request as it hits the security engine
 		filter.ActiveConnections.Inc()
 		defer filter.ActiveConnections.Dec()
+
+		atomic.AddInt64(&activeConns, 1)
+		defer atomic.AddInt64(&activeConns, -1)
 
 		timer := prometheus.NewTimer(filter.RequestLatency.WithLabelValues(r.Method, r.URL.Path))
 		defer timer.ObserveDuration()
 
-		p.ServeHTTP(w, r)
-	})
+		isUnderAttack := stats.IsUnderAttack()
+		isHighLoad := atomic.LoadInt64(&activeConns) > 200
 
-	// Security pipeline (innermost → outermost):
-	// Tarpit → WAF → StatAnomaly → Anomaly → GeoIP → Fingerprinting → L7 Rate Limit → Challenge → Security Headers
-	//
-	// The challenge layer also activates automatically when stats.IsUnderAttack() is true,
-	// regardless of the per-request toggle, to force browser verification during detected floods.
-	attackChallenge := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if stats.IsUnderAttack() {
-			// Force challenge during volumetric attack, even if toggle is off
-			middleware.ProgressiveChallenge(l7.Middleware(
-				fingerprinter.Middleware(
-					wrap("geoip", geoip.Middleware(
-						wrap("stats", stats.Middleware(
-							wrap("anomaly", anomaly.Middleware(
-								wrap("waf", filter.WAFMiddleware(
-									middleware.Tarpit(finalHandler),
-								)),
-							)),
-						)),
-					)),
-				),
-			)).ServeHTTP(w, r)
+		if isUnderAttack || isHighLoad || toggles.IsEnabled("challenge") {
+			challengeInner.ServeHTTP(w, r)
 		} else {
-			wrap("challenge", middleware.ProgressiveChallenge(
-				l7.Middleware(
-					fingerprinter.Middleware(
-						wrap("geoip", geoip.Middleware(
-							wrap("stats", stats.Middleware(
-								wrap("anomaly", anomaly.Middleware(
-									wrap("waf", filter.WAFMiddleware(
-										middleware.Tarpit(finalHandler),
-									)),
-								)),
-							)),
-						)),
-					),
-				),
-			)).ServeHTTP(w, r)
+			inner.ServeHTTP(w, r)
 		}
 	})
 
-	stack := middleware.SecurityHeaders(attackChallenge)
+	// ProxyWatcher: auto-discovers from CSF/cPHulk/iptables and merges with
+	// the manual AEGISEDGE_TRUSTED_PROXY env var. Refreshes every 5 minutes.
+	proxyWatcher := util.NewProxyWatcher(os.Getenv("AEGISEDGE_TRUSTED_PROXY"), 5*time.Minute)
+	logger.Info("Trusted proxy watcher started", "refresh_interval", "5m")
+
+	// RealIP is the outermost layer — resolves the actual client IP from proxy
+	// headers before any filter or middleware runs. List is updated live.
+	stack := middleware.RealIP(proxyWatcher)(
+		middleware.SecurityHeaders(attackChallenge),
+	)
 
 	// Metrics endpoint
 	go func() {
@@ -176,7 +189,7 @@ func main() {
 	// Management API (Protected/Internal) — wired with LiveToggles for real-time config
 	go func() {
 		mux := http.NewServeMux()
-		mgmt := manager.NewManagementAPI(activeStore, toggles)
+		mgmt := manager.NewManagementAPI(activeStore, toggles, proxyWatcher)
 		mgmt.ServeHTTP(mux)
 		logger.Info("Management API active", "port", 9091)
 		http.ListenAndServe(":9091", mux)
@@ -296,11 +309,18 @@ func main() {
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	<-done
-	logger.Info("AegisEdge stopping...")
+	logger.Info("AegisEdge stopping... cleaning up resources")
 
 	// Release Hijacked Ports
 	for ext, internal := range hijackedPorts {
 		filter.ReleasePort(ext, internal)
+	}
+
+	// Stop background cleanup loops and refresh goroutines
+	l7.Stop()
+	proxyWatcher.Stop()
+	if ls, ok := activeStore.(*store.LocalStore); ok {
+		ls.Close()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

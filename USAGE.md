@@ -1,242 +1,410 @@
-# AegisEdge Usage Guide
+# AegisEdge — Operations Manual
 
-## ⚡ Rapid Deployment (The 60-Second Shield)
-
-To instantly protect any server (WHM, Plesk, or Baremetal) without manual configuration:
-
-```bash
-sudo bash scripts/takeover.sh
-```
+This is the operator's guide. If you're reading this, AegisEdge is running and you need to control it. The management API runs on **port 9091** (keep it internal — never expose it to the internet). Prometheus metrics live on **port 9090**.
 
 ---
 
-### 0. Start the Demo Upstream (Optional)
-To test the proxy without an external service, run the included demo server:
+## Starting AegisEdge
+
 ```bash
-go run cmd/demo_server/main.go
+# Default — reads config.json from the working directory
+./aegisedge
+
+# Custom config path
+./aegisedge /etc/aegisedge/production.json
+
+# With environment overrides (useful for containers and systemd)
+AEGISEDGE_LOG_LEVEL=DEBUG AEGISEDGE_PORTS=80,443 ./aegisedge
 ```
-Starts a lightweight upstream at `localhost:3000`.
+
+A clean startup looks like this:
+
+```
+INFO  Starting AegisEdge listen_ports=[80,443] upstream=http://127.0.0.1:3000
+INFO  In-memory state initialized (Local fallback)
+INFO  Trusted proxy watcher started refresh_interval=5m
+INFO  Metrics engine active port=9090
+INFO  Management API active port=9091
+```
+
+If you see `GeoIP filter bypassed`, the `.mmdb` file is missing — everything else still runs.
 
 ---
 
-## 1. Run AegisEdge
+## Configuration Hierarchy
 
-```bash
-# Run the full package (required — main.go alone won't compile)
-go run .
+Configuration is layered — each level wins over the one before it:
 
-# Pass a custom config file path
-go run . /path/to/custom-config.json
+```
+Hardcoded defaults  →  config.json  →  Environment variables
 ```
 
-**Default behavior**: listens on ports `80` and `8080`, proxies to `http://127.0.0.1:3000`.
+### config.json Reference
 
-### Configuration (`config.json`)
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `listen_ports` | `[]int` | `[8080]` | HTTP ports to bind |
+| `tcp_ports` | `[]int` | `[]` | Raw TCP ports (SSH, DB, etc.) |
+| `upstream_addr` | `string` | `localhost:3000` | Backend to proxy to |
+| `l3_blacklist` | `[]string` | `[]` | Static IP/CIDR block list |
+| `l4_conn_limit` | `int` | `0` (off) | Max concurrent connections per IP |
+| `l7_rate_limit` | `float64` | `0` | Token Bucket refill rate (req/sec) |
+| `l7_burst_limit` | `int` | `0` | Token Bucket burst size |
+| `geoip_db_path` | `string` | `""` | Path to GeoLite2-Country.mmdb |
+| `blocked_countries` | `[]string` | `[]` | ISO-3166 alpha-2 country codes |
+| `hypervisor_mode` | `bool` | `false` | Tune for Proxmox/VMware/KVM |
+| `hot_takeover` | `bool` | `false` | Hijack occupied ports via iptables |
+| `ssl_cert_path` | `string` | auto-discover | TLS certificate |
+| `ssl_key_path` | `string` | auto-discover | TLS private key |
+| `toggles.waf` | `bool` | `true` | WAF inspection |
+| `toggles.geoip` | `bool` | `true` | Country blocking |
+| `toggles.challenge` | `bool` | `true` | JS challenge cookie |
+| `toggles.anomaly` | `bool` | `true` | Heavy-URL anomaly detection |
+| `toggles.stats` | `bool` | `true` | Statistical Z-score detector |
 
-```json
-{
-    "listen_ports": [80, 8080],
-    "tcp_ports": [],
-    "upstream_addr": "http://127.0.0.1:3000",
-    "l3_blacklist": ["1.2.3.4"],
-    "l4_conn_limit": 10,
-    "l7_rate_limit": 5.0,
-    "l7_burst_limit": 10,
-    "geoip_db_path": "GeoLite2-Country.mmdb",
-    "blocked_countries": ["CN", "RU", "IR"],
-    "hot_takeover": false,
-    "hypervisor_mode": false,
-    "ssl_cert_path": "",
-    "ssl_key_path": "",
-    "toggles": {
-        "waf": true,
-        "geoip": true,
-        "challenge": true,
-        "anomaly": true,
-        "stats": true
-    }
-}
-```
-
-**Key config fields:**
-- `l7_rate_limit` / `l7_burst_limit`: Per-IP token bucket rate (req/sec) and burst ceiling.
-- `l4_conn_limit`: Max concurrent connections per IP (idle timeout: **5 minutes**).
-- `tcp_ports`: Raw TCP ports (e.g., SSH 22, DB 3306) to shield with the L4 limiter.
-- `hot_takeover`: Uses OS-level port redirection to intercept an already-occupied port — zero downtime.
-- `hypervisor_mode`: Extends idle → 300s, read → 30s for high-density VM environments.
-- `toggles`: Each security layer can be disabled individually **at startup or live** via the Management API.
-
-### Environment Variable Overrides
+### Environment Variables
 
 | Variable | Description |
 |---|---|
-| `AEGISEDGE_PORT` | Single port to add to the listen list |
-| `AEGISEDGE_PORTS` | Comma-separated ports (e.g., `80,443,8080`) |
-| `AEGISEDGE_TCP_PORTS` | Comma-separated raw TCP ports to L4-shield |
-| `AEGISEDGE_UPSTREAM` | Override upstream address |
-| `AEGISEDGE_L7_RATE_LIMIT` | Override token bucket rate (float req/sec) |
-| `AEGISEDGE_L4_CONN_LIMIT` | Override L4 connection cap (int) |
-| `AEGISEDGE_HOT_TAKEOVER` | Set `true` or `1` to enable |
-| `AEGISEDGE_HYPERVISOR_MODE` | Set `true` or `1` to enable |
-| `AEGISEDGE_SSL_CERT` | Path to TLS certificate |
-| `AEGISEDGE_SSL_KEY` | Path to TLS private key |
-| `AEGISEDGE_REDIS_ADDR` | Redis address for distributed state (e.g., `localhost:6379`) |
+| `AEGISEDGE_LOG_LEVEL` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
+| `AEGISEDGE_PORTS` | Comma-separated HTTP ports: `80,443,8080` |
+| `AEGISEDGE_TCP_PORTS` | Comma-separated TCP ports: `22,3306,5432` |
+| `AEGISEDGE_UPSTREAM` | Backend URL |
+| `AEGISEDGE_HOT_TAKEOVER` | `true` to hijack occupied ports |
+| `AEGISEDGE_HYPERVISOR_MODE` | `true` for VM environments |
+| `AEGISEDGE_SSL_CERT` / `AEGISEDGE_SSL_KEY` | TLS paths |
+| `AEGISEDGE_L4_CONN_LIMIT` | Connection cap per IP |
+| `AEGISEDGE_L7_RATE_LIMIT` | Rate (req/sec) |
+| `AEGISEDGE_L7_BURST_LIMIT` | Burst size |
+| `AEGISEDGE_GEOIP_DB` | Path to .mmdb file |
+| `AEGISEDGE_BLOCKED_COUNTRIES` | Comma-separated ISO codes |
+| `AEGISEDGE_REDIS_ADDR` | Redis for cluster mode: `127.0.0.1:6379` |
 | `AEGISEDGE_REDIS_PASSWORD` | Redis password |
-| `AEGISEDGE_SECRET` | HMAC secret for `ae_clearance` challenge cookies |
-
-> [!NOTE]
-> **GeoIP Support**: Download `GeoLite2-Country.mmdb` from [MaxMind](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) and place it in the project root. If the file is absent, the GeoIP filter degrades gracefully with a warning log.
-
-> [!NOTE]
-> **SSL**: Port `443` triggers automatic TLS. AegisEdge auto-discovers certificates from common system paths. Falls back to HTTP with a warning if no cert is found.
+| `AEGISEDGE_SECRET` | HMAC key for challenge cookies |
+| `AEGISEDGE_TRUSTED_PROXY` | Manual trusted proxy IPs/CIDRs (merged with auto-discovery) |
+| `AEGISEDGE_WEBHOOK_URL` | Webhook URL for attack alerts (Slack, Discord, PagerDuty) |
 
 ---
 
-## 2. How the Browser Challenge Works
+## 🔧 Management API — Port 9091
 
-Every request that lacks a valid `ae_clearance` cookie is automatically gated — no opt-in required.
+### Check status
 
-```
-Request (no cookie)
-    │
-    ▼
-AegisEdge serves 503 challenge page
-    │
-    ▼
-Browser JS fires → redirects to ?ae_token=<timestamp.HMAC-SHA256>
-    │
-    ▼
-Server verifies HMAC, sets HttpOnly ae_clearance cookie (1 hour TTL)
-    │
-    ▼
-Clean redirect → request proceeds normally
-```
-
-Headless clients with no JS engine are permanently gated at the 503 step.
-
----
-
-## 3. Simulating Attacks
-
-```bash
-go run cmd/stress_tool/main.go [flags]
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `-target` | `http://localhost:8080` | Target URL |
-| `-n` | `100` | Total requests |
-| `-c` | `10` | Parallel goroutines |
-| `-mode` | `clean` | Test mode (see below) |
-
-### Modes
-
-| Mode | Payload Injected | Expected Response |
-|---|---|---|
-| `clean` | None | `200 OK` |
-| `sqli` | `?id=1' OR '1'='1` | `400` — WAF SQLi |
-| `xss` | `?q=<script>alert(1)</script>` | `400` — WAF XSS |
-| `cmd` | `?exec=;cat /etc/passwd` | `400` — WAF CMDi |
-| `traversal` | `/../../../etc/passwd` in path | `400` — WAF Path Traversal |
-| `challenge` | No `ae_clearance` cookie | `503` — Browser Challenge gate |
-| `bot` | No `User-Agent` header | `403` — Tarpit + L7 headless block |
-| `flood` | Max-speed, 50 goroutines, 5 seconds | `429` — L7 Token Bucket shed |
-
-> [!NOTE]
-> Non-bot modes send real browser-like headers (`Accept`, `Accept-Language`, `Sec-Fetch-*`) so WAF tests don't false-positive on missing headers.
-
-### Example Commands
-
-```bash
-# Baseline throughput
-go run cmd/stress_tool/main.go -n 1000 -c 50
-
-# WAF verification
-go run cmd/stress_tool/main.go -mode sqli -n 100
-go run cmd/stress_tool/main.go -mode xss -n 100
-go run cmd/stress_tool/main.go -mode cmd -n 100
-go run cmd/stress_tool/main.go -mode traversal -n 100
-
-# Token bucket stress (ignores -n and -c, runs 5 seconds at max speed)
-go run cmd/stress_tool/main.go -mode flood
-
-# Headless bot detection
-go run cmd/stress_tool/main.go -mode bot -n 50 -c 5
-```
-
-### Reading the Output
-```
-━━━ Throughput & Timing ━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Requests/sec:    12400
-  Avg Latency:     ...
-
-━━━ Latency Percentiles ━━━━━━━━━━━━━━━━━━━━━━━━━━
-  p50 / p90 / p95 / p99
-
-━━━ Mitigation Breakdown ━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✅  Legitimate (Allowed)                   :   890  (89.0%)
-  ⏱️  Shed (L7 Token Bucket Rate Limiter)    :   100  (10.0%)
-  🚫  Blocked (WAF: SQLi/XSS/CMDi/Traversal):    10   (1.0%)
-```
-
----
-
-## 4. Management API (Port `9091`)
-
-### GET `/api/status` — Proxy Status & Active Blocks
 ```bash
 curl http://localhost:9091/api/status
 ```
-Returns active block list, **current toggle state**, and timestamp.
-
-### POST `/api/block` — Block an IP
-`duration` accepts Go duration strings (`"1h"`, `"30m"`, `"24h"`) or `"permanent"` (10-year hard block). Default if omitted: **24 hours**.
-```bash
-# Temporary block
-curl -X POST http://localhost:9091/api/block \
-     -H "Content-Type: application/json" \
-     -d '{"ip": "1.2.3.4", "duration": "1h"}'
-
-# Hard block
-curl -X POST http://localhost:9091/api/block \
-     -H "Content-Type: application/json" \
-     -d '{"ip": "1.2.3.4", "duration": "permanent"}'
-```
-
-### DELETE `/api/block` — Unblock an IP
-```bash
-curl -X DELETE "http://localhost:9091/api/block?ip=1.2.3.4"
-```
-
-### PATCH `/api/config` — Toggle Features Live
-Changes apply **immediately on the next request** — no restart required.
-```bash
-# Disable WAF, keep everything else
-curl -X PATCH http://localhost:9091/api/config \
-     -H "Content-Type: application/json" \
-     -d '{"waf": false}'
-
-# Enable anomaly detection, disable challenge
-curl -X PATCH http://localhost:9091/api/config \
-     -H "Content-Type: application/json" \
-     -d '{"anomaly": true, "challenge": false}'
-```
-
-> [!NOTE]
-> When `stats.IsUnderAttack()` is true (volumetric flood detected), the challenge is **force-enabled for all traffic** regardless of the `challenge` toggle, and clears automatically after 3 calm EMA windows.
 
 ---
 
-## 5. Monitoring & Metrics (Port `9090`)
+### Block / Unblock an IP
+
+```bash
+# Temporary block
+curl -X POST http://localhost:9091/api/block \
+  -H "Content-Type: application/json" \
+  -d '{"ip": "1.2.3.4", "duration": "1h"}'
+
+# Permanent block
+curl -X POST http://localhost:9091/api/block \
+  -d '{"ip": "1.2.3.4", "duration": "permanent"}'
+
+# Unblock
+curl -X DELETE "http://localhost:9091/api/block?ip=1.2.3.4"
+```
+
+Supported durations: `30m`, `1h`, `24h`, `7d`, `permanent`
+
+---
+
+### Live Feature Toggles — no restart required
+
+Toggle any security layer on the fly. The change takes effect on the **next request**.
+
+```bash
+PATCH /api/config
+body: {"<toggle>": true|false}
+```
+
+```bash
+# Disable WAF temporarily (e.g., debugging a false positive)
+curl -X PATCH http://localhost:9091/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"waf": false}'
+
+# Force-enable challenge during an active attack
+curl -X PATCH http://localhost:9091/api/config \
+  -d '{"challenge": true}'
+```
+
+| Toggle key | Layer controlled |
+|---|---|
+| `waf` | Web Application Firewall |
+| `geoip` | Country-based blocking |
+| `challenge` | JS challenge cookie |
+| `anomaly` | Heavy-URL + entropy detection |
+| `stats` | Statistical Z-score detector |
+
+---
+
+### Trusted Proxy Whitelist — live, no restart
+
+On a CSF/cPanel server, after editing `/etc/csf/csf.allow`, trigger an immediate reload:
+
+```bash
+# Force re-read of CSF/cPHulk/iptables right now
+curl -X POST http://localhost:9091/api/proxy/reload
+
+# Add a new CDN range at runtime
+curl -X POST http://localhost:9091/api/proxy/add \
+  -d '{"entry": "103.21.244.0/22"}'
+
+# Remove an entry
+curl -X DELETE "http://localhost:9091/api/proxy/remove?entry=103.21.244.0/22"
+```
+
+The watcher auto-refreshes every 5 minutes regardless — the manual reload is for when you can't wait.
+
+---
+
+## ⚡ Rate Limit Tuning
+
+I set rate limits conservatively by default. Tune to your application's actual traffic profile:
+
+```json
+{
+  "l7_rate_limit": 10.0,
+  "l7_burst_limit": 20
+}
+```
+
+- `l7_rate_limit` — the Token Bucket refill rate (requests/second per IP)
+- `l7_burst_limit` — how many queued requests an IP can hold before being dropped
+
+The reputation engine scales these automatically per IP. A client that has earned trust (score +10) gets **2×** the configured rate. A flagged client (score −5) gets **0.75×**. A hostile client (score −10) triggers kernel-level `iptables -j DROP` — the block goes below the application layer entirely.
+
+---
+
+## 🌍 GeoIP Blocking
+
+Get the free MaxMind GeoLite2 database and point AegisEdge at it:
+
+```bash
+AEGISEDGE_GEOIP_DB=/usr/share/GeoIP/GeoLite2-Country.mmdb
+AEGISEDGE_BLOCKED_COUNTRIES=CN,RU,KP,IR
+```
+
+If the file isn't there, the filter skips gracefully — you'll see the warning in logs but nothing else breaks.
+
+---
+
+## 🎯 Challenge Cookie
+
+When AegisEdge challenges a client:
+
+1. Serves a JS page (HTTP 503) — browser runs the script
+2. Browser GETs `?ae_token=<timestamp>.<HMAC-SHA256>`
+3. Server validates the HMAC, sets `ae_clearance` (HttpOnly, 1 hour, **IP-bound**)
+4. All subsequent requests from that browser pass silently
+
+The IP-binding is intentional. A stolen cookie is useless from a different IP. Clients switching IPs (VPN, mobile handoff) re-challenge — this is a feature, not a bug.
+
+Set your signing secret:
+```bash
+export AEGISEDGE_SECRET="your-long-random-secret-here"
+```
+
+---
+
+## 📊 Prometheus Metrics — Port 9090
 
 ```bash
 curl http://localhost:9090/metrics
 ```
 
-| Metric | Labels | Description |
-|---|---|---|
-| `aegisedge_blocked_requests_total` | `layer`, `reason` | Blocked requests, by layer and reason |
-| `aegisedge_active_connections` | — | Currently active proxied connections (gauge) |
-| `aegisedge_request_duration_seconds` | `method`, `path` | Latency histogram for proxied requests |
+Key metrics (all prefixed `aegisedge_`):
+```
+aegisedge_blocked_requests_total{layer="L3|L4|L7", reason="..."}
+aegisedge_active_connections   (gauge — current in-flight requests)
+aegisedge_request_duration_seconds{method, path}   (histogram — latency per endpoint)
+```
 
-**`reason` label values:** `rate_limit`, `no_user_agent`, `sqli`, `xss`, `cmd_injection`, `traversal`, `geoip`, `anomaly_heavy_url`, `low_entropy`, `fingerprint`, `stat_anomaly`, `active_block`, `blacklist`, `conn_limit`
+Example Grafana alert for block rate > 100/min:
+```promql
+rate(aegisedge_blocked_requests_total[1m]) * 60 > 100
+```
+
+P99 latency alert:
+```promql
+histogram_quantile(0.99, rate(aegisedge_request_duration_seconds_bucket[5m])) > 0.5
+```
+
+---
+
+## � Webhook Alerts
+
+AegisEdge can push attack notifications to any webhook endpoint (Slack, Discord, PagerDuty, custom). Set the URL and forget — alerts fire asynchronously in a goroutine so they never add latency to requests.
+
+```bash
+export AEGISEDGE_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../xxx"
+```
+
+Payload format:
+```json
+{
+  "text": "[AegisEdge Alert] VOLUMETRIC ATTACK DETECTED: RPS hit 450.00 (3-Sigma Threshold: 38.50)",
+  "timestamp": "2026-02-24T16:45:00Z",
+  "severity": "CRITICAL"
+}
+```
+
+If `AEGISEDGE_WEBHOOK_URL` isn't set, the notifier is a no-op — no errors, no overhead.
+
+---
+
+## ⚡ High-Load Auto-Challenge
+
+Beyond the Z-Score statistical detector, AegisEdge has a second safety net: when concurrent in-flight connections exceed **200**, the JS challenge is force-enabled for all traffic — regardless of the challenge toggle or anomaly detector state. This catches slow-burn attacks that stay under the statistical threshold but still exhaust backend resources.
+
+This is hardcoded in `main.go` and always active. You don't need to configure anything.
+
+---
+
+
+## 📋 Log Reference
+
+AegisEdge emits structured JSON. Every line has `time`, `level`, `msg`, and relevant fields.
+
+| Level | Message | Meaning |
+|---|---|---|
+| `INFO` | `Starting AegisEdge` | Startup, shows active ports and upstream |
+| `INFO` | `Trusted proxy watcher started` | Background refresh goroutine started |
+| `INFO` | `PROXY Protocol: resolved real client IP` | TCP stream IP extracted from PROXY header |
+| `WARN` | `L7 rate limit exceeded (token bucket)` | IP throttled — shows effective rate |
+| `WARN` | `WAF blocked request` | Shows pattern and field (query/body/path) |
+| `WARN` | `Blocked request from unauthorized country` | GeoIP match |
+| `WARN` | `Anomaly detected: High frequency on heavy URL` | Repeated hammering of heavy endpoints |
+| `WARN` | `Anomaly detected: Behavioral lock-on` | Low-entropy request pattern (bot-like) |
+| `WARN` | `Invalid challenge cookie signature or IP mismatch` | Cookie tampered or IP changed |
+| `WARN` | `Tarpitting suspicious request` | Shows the delay in ms |
+| `WARN` | `L4 stream connection rejected` | TCP flood past connection cap |
+| `ERROR` | `Failed to load config` | Config file parse error — check JSON |
+
+Adjust verbosity on the fly by restarting with `AEGISEDGE_LOG_LEVEL=DEBUG` during an incident. Switch back to `INFO` after — debug logs are verbose under load.
+
+---
+
+## 🔌 Hot Takeover
+
+Enable this if you're running Apache or Nginx on port 80/443 and want to insert AegisEdge without a maintenance window:
+
+```bash
+AEGISEDGE_HOT_TAKEOVER=true ./aegisedge
+```
+
+AegisEdge uses `iptables PREROUTING REDIRECT` to intercept the port before the original service sees the packet. The existing service keeps running unchanged. On shutdown, the REDIRECT rule is removed and the original service reclaims its port.
+
+Requires root or `CAP_NET_ADMIN`.
+
+---
+
+## 🌊 TCP Port Shielding
+
+Protect raw TCP ports with per-IP connection limiting:
+
+```json
+{
+  "tcp_ports": [22, 3306, 5432]
+}
+```
+
+If your upstream is HAProxy or AWS NLB and it sends PROXY Protocol headers, AegisEdge strips the header automatically and applies rate limits to the **real client IP**, not the load balancer.
+
+HAProxy config for this:
+```
+server backend 10.0.0.1:22 send-proxy
+```
+
+---
+
+## 🗄️ Redis Cluster Mode
+
+Share state across multiple AegisEdge nodes:
+
+```bash
+AEGISEDGE_REDIS_ADDR=10.0.0.5:6379 \
+AEGISEDGE_REDIS_PASSWORD=yourpassword \
+./aegisedge
+```
+
+I use LUA scripts for atomic increments — no race conditions under concurrent flood. The system falls back to local in-memory state transparently if Redis goes down.
+
+---
+
+## 🔐 TLS / HTTPS
+
+I built auto-discovery so you don't have to touch SSL config on cPanel or Let's Encrypt servers. The discovery order:
+
+1. `AEGISEDGE_SSL_CERT` / `AEGISEDGE_SSL_KEY` env vars
+2. `ssl_cert_path` / `ssl_key_path` in config.json
+3. `certs/cert.pem` + `certs/key.pem` (local directory)
+4. Let's Encrypt: `/etc/letsencrypt/live/*/fullchain.pem`
+5. cPanel/WHM: `/var/cpanel/ssl/installed/certs/*.crt`
+6. Plesk: `/usr/local/psa/var/certificates/*`
+7. System fallback: `/etc/ssl/certs/aegis.crt`
+
+To be explicit:
+```bash
+AEGISEDGE_SSL_CERT=/etc/letsencrypt/live/example.com/fullchain.pem \
+AEGISEDGE_SSL_KEY=/etc/letsencrypt/live/example.com/privkey.pem \
+./aegisedge
+```
+
+---
+
+## 🛑 Graceful Shutdown
+
+Send `SIGTERM` or hit `Ctrl+C`. AegisEdge will:
+
+1. Stop accepting new connections
+2. Drain in-flight requests (10-second window)
+3. Stop background goroutines: L7 cleanup, ProxyWatcher refresh, LocalStore expiry
+4. Release iptables rules from Hot Takeover ports
+5. Log `All servers stopped gracefully`
+
+```bash
+kill -TERM $(pgrep aegisedge)
+```
+
+---
+
+## 🔍 Troubleshooting
+
+**"All traffic is blocked"**
+- Run with `AEGISEDGE_LOG_LEVEL=DEBUG` and watch the `remote_addr` field in WARN logs
+- If it's your CDN or LB IP instead of the real client → trusted proxy not configured
+- Run `curl -X POST localhost:9091/api/proxy/reload` or set `AEGISEDGE_TRUSTED_PROXY`
+
+**"Challenge never clears"**
+- Is `AEGISEDGE_SECRET` set? Without it, HMAC mismatches on every verify
+- Client switching IPs? That re-triggers challenge by design
+- Clock drift? Cookie TTL is 1 hour — validate server time with `date`
+
+**"GeoIP not blocking"**
+- Check the `.mmdb` file exists and is readable
+- Look for `GeoIP filter bypassed` in startup logs
+- Confirm `toggles.geoip: true` or PATCH it on via API
+
+**"Rate limits too aggressive"**
+- Check the reputation score for the affected IP — it may have been penalised
+- Review `effective_rate` in the WARN log line to see what multiplier was applied
+- Temporarily disable: `curl -X PATCH localhost:9091/api/config -d '{"challenge": false}'`
+
+**"Port already in use"**
+```bash
+AEGISEDGE_HOT_TAKEOVER=true ./aegisedge
+```
+
+**"High CPU during attack"**
+- Switch to `AEGISEDGE_LOG_LEVEL=ERROR` to cut log I/O
+- The statistical detector will auto-enable challenge mode after 10× burst — let it work
+- If the source is a few IPs, block them at L3 via API: they'll hit iptables DROP before reaching Go code
