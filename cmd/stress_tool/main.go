@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,10 +71,11 @@ func main() {
 	fmt.Printf("  Expected:    %s\n", info.expected)
 
 	if *mode == "flood" {
-		// Flood mode: ignore -c and -n, just hammer as fast as possible for 5 seconds
-		fmt.Printf("  Duration:    5 seconds (ignores -n and -c)\n")
+		floodDuration := flag.Int("d", 30, "Flood duration in seconds")
+		flag.Parse() // re-parse for -d
+		fmt.Printf("  Duration:    %d seconds (ignores -n and -c)\n", *floodDuration)
 		fmt.Printf("──────────────────────────────────────────────────\n\n")
-		runFlood(*target)
+		runFlood(*target, *floodDuration)
 		return
 	}
 
@@ -127,15 +129,52 @@ func main() {
 	printReport(results, time.Since(startTime))
 }
 
-// runFlood fires requests as fast as possible for 5 seconds to trigger the token bucket.
-func runFlood(target string) {
-	results := make(chan result, 100000)
+// runFlood fires requests as fast as possible for the given duration.
+// Uses atomic counters for accurate RPS — no channel cap, no silent drops.
+func runFlood(target string, durationSecs int) {
 	done := make(chan struct{})
 	startTime := time.Now()
 
-	for i := 0; i < 50; i++ {
-		go func() {
+	// Atomic counters for every request (no sampling loss)
+	var totalRequests int64
+	var totalErrors int64
+	var status2xx int64
+	var status4xx int64
+	var status5xx int64
+	var statusOther int64
+
+	// Sampled latency: capture 1-in-100 requests to avoid channel pressure
+	const latencySampleRate = 100
+	latencyChan := make(chan time.Duration, 50000)
+
+	// Live RPS ticker
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		var lastCount int64
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				current := atomic.LoadInt64(&totalRequests)
+				delta := current - lastCount
+				lastCount = current
+				elapsed := time.Since(startTime).Seconds()
+				fmt.Printf("  ⚡ Live: %d total | %d/5s | avg %.0f RPS\n",
+					current, delta, float64(current)/elapsed)
+			}
+		}
+	}()
+
+	const workers = 50
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
 			client := &http.Client{Timeout: 5 * time.Second}
+			localCount := int64(0)
 			for {
 				select {
 				case <-done:
@@ -144,32 +183,124 @@ func runFlood(target string) {
 					req, _ := http.NewRequest("GET", target, nil)
 					req.Header.Set("User-Agent", "AegisEdge-FloodTest/2.0")
 					req.Header.Set("Accept", "text/html")
+
 					reqStart := time.Now()
 					resp, err := client.Do(req)
-					duration := time.Since(reqStart)
+					latency := time.Since(reqStart)
+					localCount++
+					atomic.AddInt64(&totalRequests, 1)
+
 					if err != nil {
-						select {
-						case results <- result{status: 0, latency: duration}:
-						default:
+						atomic.AddInt64(&totalErrors, 1)
+						// Sample latency
+						if localCount%latencySampleRate == 0 {
+							select {
+							case latencyChan <- latency:
+							default:
+							}
 						}
 						continue
 					}
-					select {
-					case results <- result{status: resp.StatusCode, latency: duration}:
+
+					// Track status codes atomically
+					switch {
+					case resp.StatusCode >= 200 && resp.StatusCode < 300:
+						atomic.AddInt64(&status2xx, 1)
+					case resp.StatusCode >= 400 && resp.StatusCode < 500:
+						atomic.AddInt64(&status4xx, 1)
+					case resp.StatusCode >= 500:
+						atomic.AddInt64(&status5xx, 1)
 					default:
+						atomic.AddInt64(&statusOther, 1)
 					}
+
+					// Sample latency (1-in-100)
+					if localCount%latencySampleRate == 0 {
+						select {
+						case latencyChan <- latency:
+						default:
+						}
+					}
+
 					resp.Body.Close()
 				}
 			}
-		}()
+		}(i)
 	}
 
-	time.Sleep(80 * time.Second)
+	time.Sleep(time.Duration(durationSecs) * time.Second)
 	close(done)
-	time.Sleep(200 * time.Millisecond) // let goroutines drain
-	close(results)
+	wg.Wait()
+	close(latencyChan)
 
-	printReport(results, time.Since(startTime))
+	totalDuration := time.Since(startTime)
+
+	// Collect sampled latencies
+	var latencies []time.Duration
+	for l := range latencyChan {
+		latencies = append(latencies, l)
+	}
+
+	// Sort for percentiles
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+
+	// Print accurate report
+	total := atomic.LoadInt64(&totalRequests)
+	rps := float64(total) / totalDuration.Seconds()
+
+	fmt.Printf("━━━ Throughput & Timing ━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("  Total Time:      %v\n", totalDuration.Round(time.Millisecond))
+	fmt.Printf("  Total Requests:  %d (actual, no sampling loss)\n", total)
+	fmt.Printf("  Requests/sec:    %.0f\n", rps)
+	fmt.Printf("  Errors:          %d\n", atomic.LoadInt64(&totalErrors))
+
+	if len(latencies) > 0 {
+		var totalLatency time.Duration
+		for _, l := range latencies {
+			totalLatency += l
+		}
+		avg := totalLatency / time.Duration(len(latencies))
+		p50 := latencies[int(float64(len(latencies))*0.50)]
+		p90 := latencies[int(float64(len(latencies))*0.90)]
+		p95 := latencies[int(float64(len(latencies))*0.95)]
+		p99idx := int(float64(len(latencies)) * 0.99)
+		if p99idx >= len(latencies) {
+			p99idx = len(latencies) - 1
+		}
+		p99 := latencies[p99idx]
+
+		fmt.Printf("  Avg Latency:     %v (sampled 1:%d)\n", avg.Round(time.Microsecond), latencySampleRate)
+		fmt.Printf("  Min Latency:     %v\n", latencies[0].Round(time.Microsecond))
+		fmt.Printf("  Max Latency:     %v\n", latencies[len(latencies)-1].Round(time.Microsecond))
+
+		fmt.Printf("\n━━━ Latency Percentiles (sampled) ━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("  p50: %v\n", p50.Round(time.Microsecond))
+		fmt.Printf("  p90: %v\n", p90.Round(time.Microsecond))
+		fmt.Printf("  p95: %v\n", p95.Round(time.Microsecond))
+		fmt.Printf("  p99: %v\n", p99.Round(time.Microsecond))
+	}
+
+	fmt.Printf("\n━━━ Mitigation Breakdown ━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	s2 := atomic.LoadInt64(&status2xx)
+	s4 := atomic.LoadInt64(&status4xx)
+	s5 := atomic.LoadInt64(&status5xx)
+	sO := atomic.LoadInt64(&statusOther)
+	sE := atomic.LoadInt64(&totalErrors)
+
+	printStatusLine("✅  2xx (Allowed)", s2, total)
+	printStatusLine("🚫  4xx (Blocked: WAF/L3/GeoIP/Fingerprint)", s4, total)
+	printStatusLine("🛡️  5xx (Challenge/Server Error)", s5, total)
+	printStatusLine("↩️   Other", sO, total)
+	printStatusLine("💀  Errors (Timeout/Connection)", sE, total)
+	fmt.Printf("──────────────────────────────────────────────────\n")
+}
+
+func printStatusLine(label string, count, total int64) {
+	if count == 0 {
+		return
+	}
+	pct := float64(count) / float64(total) * 100
+	fmt.Printf("  %-45s : %7d  (%.1f%%)\n", label, count, pct)
 }
 
 func printReport(results <-chan result, totalDuration time.Duration) {

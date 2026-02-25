@@ -12,10 +12,11 @@ Engineering is about data, not claims. AegisEdge is tuned to the **theoretical l
 
 | Metric | Value |
 |---|---|
-| **Throughput** | **12,400+ Req/Sec** clean traffic |
-| **p50 Latency** | **2.9ms** under 50-goroutine flood |
-| **p99 Latency** | **23.7ms** |
-| **Mitigation** | 99.99% of flood traffic rejected at L3 Fast-Path |
+| **Throughput** | **8,500+ Req/Sec** under 50-goroutine flood (single machine, both attacker and proxy) |
+| **p50 Latency** | **4.4ms** per blocked request |
+| **p99 Latency** | **17.9ms** |
+| **Total Handled** | 256,665 requests in 30 seconds, zero errors |
+| **Mitigation** | 100% of flood traffic rejected at L3 Fast-Path |
 | **CPU Breakdown** | 85% Go runtime + kernel, **15% AegisEdge logic** |
 
 ### Where the CPU Actually Goes (pprof)
