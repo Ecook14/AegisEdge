@@ -11,9 +11,11 @@ import (
 type Config struct {
 	ListenPort       int          `json:"listen_port"` // Legacy support
 	ListenPorts      []int        `json:"listen_ports"`
-	TcpPorts         []int        `json:"tcp_ports"`
-	UpstreamAddr     string       `json:"upstream_addr"`
-	L3Blacklist      []string     `json:"l3_blacklist"`
+	TcpPorts         []int             `json:"tcp_ports"`
+	UpstreamAddr     string            `json:"upstream_addr"`
+	UpstreamMap      map[string]string `json:"upstream_map"`
+	L3Blacklist      []string          `json:"l3_blacklist"`
+	Whitelist        []string          `json:"whitelist"`
 	L4ConnLimit      int          `json:"l4_conn_limit"`
 	L7RateLimit      float64      `json:"l7_rate_limit"`
 	L7BurstLimit     int          `json:"l7_burst_limit"`
@@ -22,8 +24,9 @@ type Config struct {
 	HypervisorMode   bool         `json:"hypervisor_mode"`
 	HotTakeover      bool         `json:"hot_takeover"`
 	SSLCertPath      string       `json:"ssl_cert_path"`
-	SSLKeyPath       string       `json:"ssl_key_path"`
-	Toggles          FeatureFlags `json:"toggles"`
+	SSLKeyPath       string            `json:"ssl_key_path"`
+	LogLevel         string            `json:"log_level"`
+	Toggles          FeatureFlags      `json:"toggles"`
 }
 
 type FeatureFlags struct {
@@ -49,11 +52,21 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	
 	// 2. Load from file (Overrides Defaults)
-	file, err := os.Open(path)
-	if err == nil {
+	if _, err := os.Stat(path); err != nil {
+		if path != "config.json" {
+			return nil, fmt.Errorf("config file not found: %s", path)
+		}
+		// Default config.json missing is okay, use defaults
+	} else {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
 		decoder := json.NewDecoder(file)
-		err = decoder.Decode(&cfg)
-		file.Close()
+		if err := decoder.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse config %s: %v", path, err)
+		}
 	}
 
 	// Handle legacy port synchronization

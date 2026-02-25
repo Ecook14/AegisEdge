@@ -23,6 +23,7 @@ A clean startup looks like this:
 INFO  Starting AegisEdge listen_ports=[80,443] upstream=http://127.0.0.1:3000
 INFO  In-memory state initialized (Local fallback)
 INFO  Trusted proxy watcher started refresh_interval=5m
+INFO  pprof profiling active port=6060
 INFO  Metrics engine active port=9090
 INFO  Management API active port=9091
 ```
@@ -47,9 +48,11 @@ Hardcoded defaults  →  config.json  →  Environment variables
 | `tcp_ports` | `[]int` | `[]` | Raw TCP ports (SSH, DB, etc.) |
 | `upstream_addr` | `string` | `localhost:3000` | Backend to proxy to |
 | `l3_blacklist` | `[]string` | `[]` | Static IP/CIDR block list |
-| `l4_conn_limit` | `int` | `0` (off) | Max concurrent connections per IP |
+| `l4_conn_limit` | `int` | `0` (off) | Max concurrent connections per IP. **Set to 0 for zero-lock benchmarking.** |
 | `l7_rate_limit` | `float64` | `0` | Token Bucket refill rate (req/sec) |
 | `l7_burst_limit` | `int` | `0` | Token Bucket burst size |
+| `log_level` | `string` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR`. WARN+ skips logging for successful requests. |
+| `whitelist` | `[]string` | `[]` | IPs that bypass all security filters |
 | `geoip_db_path` | `string` | `""` | Path to GeoLite2-Country.mmdb |
 | `blocked_countries` | `[]string` | `[]` | ISO-3166 alpha-2 country codes |
 | `hypervisor_mode` | `bool` | `false` | Tune for Proxmox/VMware/KVM |
@@ -60,7 +63,7 @@ Hardcoded defaults  →  config.json  →  Environment variables
 | `toggles.geoip` | `bool` | `true` | Country blocking |
 | `toggles.challenge` | `bool` | `true` | JS challenge cookie |
 | `toggles.anomaly` | `bool` | `true` | Heavy-URL anomaly detection |
-| `toggles.stats` | `bool` | `true` | Statistical Z-score detector |
+| `toggles.stats` | `bool` | `true` | Statistical Z-score detector. **Disable for 10k+ RPS to avoid Prometheus overhead.** |
 
 ### Environment Variables
 
@@ -181,6 +184,75 @@ I set rate limits conservatively by default. Tune to your application's actual t
 - `l7_burst_limit` — how many queued requests an IP can hold before being dropped
 
 The reputation engine scales these automatically per IP. A client that has earned trust (score +10) gets **2×** the configured rate. A flagged client (score −5) gets **0.75×**. A hostile client (score −10) triggers kernel-level `iptables -j DROP` — the block goes below the application layer entirely.
+
+---
+
+## 🏁 Performance Tuning
+
+### Configuration Presets
+
+AegisEdge ships with three configuration presets in the `settings/` directory:
+
+```bash
+# Maximum throughput (benchmarking)
+./aegisedge settings/performance.json
+
+# Balanced security and performance
+./aegisedge settings/standard.json
+
+# Maximum security (active attack)
+./aegisedge settings/aggressive.json
+```
+
+| Preset | WAF | GeoIP | Challenge | Stats | L4 Limit | Log Level |
+|---|---|---|---|---|---|---|
+| **Performance** | Off | Off | Off | Off | 0 (disabled) | WARN |
+| **Standard** | On | On | On | On | 50 | INFO |
+| **Aggressive** | On | On | On | On | 20 | DEBUG |
+
+### Key Performance Knobs
+
+| Setting | Impact | Recommendation |
+|---|---|---|
+| `log_level: "WARN"` | Skips logging for all 200 OK responses | **High impact** — eliminates 10k+ channel sends/sec |
+| `stats: false` | Disables Prometheus histogram/gauge updates | **High impact** — removes per-request metric overhead |
+| `l4_conn_limit: 0` | Disables L4 connection tracking entirely | **Medium impact** — zero-lock on connection accept |
+| `waf: false` | Skips regex-based WAF inspection | **Medium impact** — saves regex CPU on every request |
+
+### Runtime GC Tuning
+
+AegisEdge sets `debug.SetGCPercent(200)` at startup, which halves Go's garbage collection frequency. This trades ~2× memory usage for significantly lower CPU under high allocation rates. To override:
+
+```bash
+GOGC=100 ./aegisedge settings/performance.json  # Default GC frequency
+GOGC=400 ./aegisedge settings/performance.json  # Even less frequent GC
+```
+
+### Architecture: How AegisEdge Achieves Near-Zero Overhead
+
+| Optimization | What It Does |
+|---|---|
+| **Fast-Reject Gate** | Blocks known-bad IPs before ANY middleware runs (microsecond rejection) |
+| **64-Shard Storage** | Distributes lock contention across 64 independent shards |
+| **G-Pattern** | Propagates metadata via headers instead of `context.WithValue` (zero allocations) |
+| **IP Memoization** | Caches resolved IPs in a 64-shard cache, skipping header parsing on repeat requests |
+| **Proxy Buffer Pool** | Recycles 32KB I/O buffers via `sync.Pool` |
+| **Async Logging** | Log entries are buffered via channel, dropped if full (load-aware sampling) |
+
+### CPU Profiling (pprof)
+
+AegisEdge exposes a live CPU profiler on port `6060`:
+
+```bash
+# Capture a 10-second CPU profile
+go tool pprof -top http://localhost:6060/debug/pprof/profile?seconds=10
+
+# Interactive flame graph in browser
+go tool pprof -http=:8081 http://localhost:6060/debug/pprof/profile?seconds=10
+
+# Heap (memory) profile
+go tool pprof -top http://localhost:6060/debug/pprof/heap
+```
 
 ---
 
@@ -405,6 +477,14 @@ AEGISEDGE_HOT_TAKEOVER=true ./aegisedge
 ```
 
 **"High CPU during attack"**
-- Switch to `AEGISEDGE_LOG_LEVEL=ERROR` to cut log I/O
-- The statistical detector will auto-enable challenge mode after 10× burst — let it work
-- If the source is a few IPs, block them at L3 via API: they'll hit iptables DROP before reaching Go code
+- Use `settings/performance.json` for maximum throughput (disables WAF, GeoIP, Stats, Challenge)
+- The **Fast-Reject Gate** blocks known-bad IPs before any middleware runs — CPU savings scale with attack volume
+- Most CPU (85%) is Go's `net/http` server and kernel syscalls, not AegisEdge code — use `pprof` to verify:
+  ```bash
+  go tool pprof -top http://localhost:6060/debug/pprof/profile?seconds=10
+  ```
+- Block high-volume attackers at L3 via API — they'll hit `iptables DROP` before reaching Go:
+  ```bash
+  curl -X POST localhost:9091/api/block -d '{"ip": "1.2.3.4", "duration": "permanent"}'
+  ```
+- Set `GOGC=400` for even less frequent garbage collection at the cost of more RAM

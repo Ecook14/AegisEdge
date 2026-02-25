@@ -3,27 +3,20 @@
 package util
 
 import (
-	"context"
+	//"context"
 	"net"
 	"net/http"
 )
 
-// ctxKey is an unexported type for context keys scoped to this package.
-type ctxKey string
-
-// RealIPKey is the context key under which the resolved client IP is stored.
-const RealIPKey ctxKey = "real_ip"
-
-// SetRealIP stores a resolved IP into the request context.
-// Called by the RealIP middleware in the middleware package.
+// SetRealIP stores a resolved IP into the request headers to avoid context allocations.
 func SetRealIP(r *http.Request, ip string) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), RealIPKey, ip))
+	r.Header.Set("X-Aegis-Real-IP", ip)
+	return r
 }
 
-// GetRealIP retrieves the resolved client IP from the request context.
-// Falls back to r.RemoteAddr (with port stripped) if not present.
+// GetRealIP retrieves the resolved client IP from the request headers.
 func GetRealIP(r *http.Request) string {
-	if ip, ok := r.Context().Value(RealIPKey).(string); ok && ip != "" {
+	if ip := r.Header.Get("X-Aegis-Real-IP"); ip != "" {
 		return ip
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)

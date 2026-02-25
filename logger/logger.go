@@ -31,6 +31,10 @@ func SetLevel(level string) {
 	}
 }
 
+func GetLevel() slog.Level {
+	return levelVar.Level()
+}
+
 func Debug(msg string, args ...any) {
 	Log.Debug(msg, args...)
 }

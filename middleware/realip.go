@@ -4,19 +4,59 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"aegisedge/util"
 )
 
+const ipShards = 64
+
+type ipCacheShard struct {
+	mu    sync.RWMutex
+	cache map[string]string
+}
+
+var memoizedIPs [ipShards]*ipCacheShard
+
+func init() {
+	for i := 0; i < ipShards; i++ {
+		memoizedIPs[i] = &ipCacheShard{
+			cache: make(map[string]string),
+		}
+	}
+}
+
+func getIpShard(remoteAddr string) *ipCacheShard {
+	// Fast FNV-like hash for the remoteAddr string
+	hash := uint32(0)
+	for i := 0; i < len(remoteAddr); i++ {
+		hash = 31*hash + uint32(remoteAddr[i])
+	}
+	return memoizedIPs[hash%ipShards]
+}
+
 // RealIP middleware resolves the true client IP from trusted proxy headers.
 // Priority: CF-Connecting-IP → X-Real-IP → X-Forwarded-For → RemoteAddr.
-//
-// The watcher's trusted list is read atomically on every request — no restart
-// required when CSF/iptables/cPHulk lists change.
 func RealIP(watcher *util.ProxyWatcher) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			shard := getIpShard(r.RemoteAddr)
+			shard.mu.RLock()
+			cached, ok := shard.cache[r.RemoteAddr]
+			shard.mu.RUnlock()
+
+			if ok {
+				next.ServeHTTP(w, util.SetRealIP(r, cached))
+				return
+			}
+
 			ip := extractIP(r, watcher)
+
+			// Store in cache
+			shard.mu.Lock()
+			shard.cache[r.RemoteAddr] = ip
+			shard.mu.Unlock()
+
 			next.ServeHTTP(w, util.SetRealIP(r, ip))
 		})
 	}

@@ -3,78 +3,74 @@ package manager
 import (
 	"encoding/json"
 	"net/http"
-	"sync"
+	//"sync"
+	"sync/atomic"
 	"time"
 
 	"aegisedge/logger"
 	"aegisedge/store"
+	"aegisedge/filter"
 	utilpkg "aegisedge/util"
 )
 
-// LiveToggles holds the runtime feature flag state, safe for concurrent reads/writes.
+// LiveToggles holds the runtime feature flag state, lockless for extreme throughput.
 type LiveToggles struct {
-	mu       sync.RWMutex
-	WAF      bool
-	GeoIP    bool
-	Challenge bool
-	Anomaly  bool
-	Stats    bool
+	WAF       atomic.Bool
+	GeoIP     atomic.Bool
+	Challenge atomic.Bool
+	Anomaly   atomic.Bool
+	Stats     atomic.Bool
 }
 
 func NewLiveToggles(waf, geoip, challenge, anomaly, stats bool) *LiveToggles {
-	return &LiveToggles{
-		WAF:      waf,
-		GeoIP:    geoip,
-		Challenge: challenge,
-		Anomaly:  anomaly,
-		Stats:    stats,
-	}
+	t := &LiveToggles{}
+	t.WAF.Store(waf)
+	t.GeoIP.Store(geoip)
+	t.Challenge.Store(challenge)
+	t.Anomaly.Store(anomaly)
+	t.Stats.Store(stats)
+	return t
 }
 
 func (t *LiveToggles) IsEnabled(feature string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	switch feature {
 	case "waf":
-		return t.WAF
+		return t.WAF.Load()
 	case "geoip":
-		return t.GeoIP
+		return t.GeoIP.Load()
 	case "challenge":
-		return t.Challenge
+		return t.Challenge.Load()
 	case "anomaly":
-		return t.Anomaly
+		return t.Anomaly.Load()
 	case "stats":
-		return t.Stats
+		return t.Stats.Load()
 	}
 	return true
 }
 
 func (t *LiveToggles) Set(feature string, enabled bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	switch feature {
 	case "waf":
-		t.WAF = enabled
+		t.WAF.Store(enabled)
 	case "geoip":
-		t.GeoIP = enabled
+		t.GeoIP.Store(enabled)
 	case "challenge":
-		t.Challenge = enabled
+		t.Challenge.Store(enabled)
 	case "anomaly":
-		t.Anomaly = enabled
+		t.Anomaly.Store(enabled)
 	case "stats":
-		t.Stats = enabled
+		t.Stats.Store(enabled)
+		filter.SetMetricsEnabled(enabled)
 	}
 }
 
 func (t *LiveToggles) Snapshot() map[string]bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	return map[string]bool{
-		"waf":       t.WAF,
-		"geoip":     t.GeoIP,
-		"challenge": t.Challenge,
-		"anomaly":   t.Anomaly,
-		"stats":     t.Stats,
+		"waf":       t.WAF.Load(),
+		"geoip":     t.GeoIP.Load(),
+		"challenge": t.Challenge.Load(),
+		"anomaly":   t.Anomaly.Load(),
+		"stats":     t.Stats.Load(),
 	}
 }
 
@@ -83,6 +79,8 @@ type ManagementAPI struct {
 	Store        store.Storer
 	Toggles      *LiveToggles
 	ProxyWatcher *utilpkg.ProxyWatcher
+	RequestCount atomic.Uint64
+	StartTime    time.Time
 }
 
 type BlockRequest struct {
@@ -91,7 +89,16 @@ type BlockRequest struct {
 }
 
 func NewManagementAPI(s store.Storer, toggles *LiveToggles, pw *utilpkg.ProxyWatcher) *ManagementAPI {
-	return &ManagementAPI{Store: s, Toggles: toggles, ProxyWatcher: pw}
+	return &ManagementAPI{
+		Store:        s,
+		Toggles:      toggles,
+		ProxyWatcher: pw,
+		StartTime:    time.Now(),
+	}
+}
+
+func (api *ManagementAPI) TrackRequest() {
+	api.RequestCount.Add(1)
 }
 
 func (api *ManagementAPI) ServeHTTP(mux *http.ServeMux) {
@@ -134,11 +141,20 @@ func (api *ManagementAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to list blocks", http.StatusInternalServerError)
 		return
 	}
+
+	totalReqs := api.RequestCount.Load()
+	uptimeSeconds := time.Since(api.StartTime).Seconds()
+	avgRps := float64(totalReqs) / uptimeSeconds
+
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":        "active",
-		"active_blocks": blocks,
-		"toggles":       api.Toggles.Snapshot(),
-		"timestamp":     time.Now(),
+		"status":           "active",
+		"uptime_seconds":   int(uptimeSeconds),
+		"total_requests":   totalReqs,
+		"average_rps":      avgRps,
+		"active_blocks":    blocks,
+		"fast_path_blocks": filter.GetSoftBlocks(),
+		"toggles":          api.Toggles.Snapshot(),
+		"timestamp":        time.Now(),
 	})
 }
 

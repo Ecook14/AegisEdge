@@ -57,28 +57,36 @@ func WAFMiddleware(next http.Handler) http.Handler {
 
 			if sqliRegex.MatchString(p) {
 				logger.Warn("Blocked SQLi attempt", "remote_addr", r.RemoteAddr, "payload", p)
-				BlockedRequests.WithLabelValues("L7", "sqli").Inc()
+				if MetricsEnabled() {
+					BlockedRequests.WithLabelValues("L7", "sqli").Inc()
+				}
 				http.Error(w, "Malicious request detected", http.StatusBadRequest)
 				return
 			}
 
 			if xssRegex.MatchString(p) {
 				logger.Warn("Blocked XSS attempt", "remote_addr", r.RemoteAddr, "payload", p)
-				BlockedRequests.WithLabelValues("L7", "xss").Inc()
+				if MetricsEnabled() {
+					BlockedRequests.WithLabelValues("L7", "xss").Inc()
+				}
 				http.Error(w, "Malicious request detected", http.StatusBadRequest)
 				return
 			}
 
 			if cmdInjRegex.MatchString(p) {
 				logger.Warn("Blocked Command Injection attempt", "remote_addr", r.RemoteAddr, "payload", p)
-				BlockedRequests.WithLabelValues("L7", "cmd_injection").Inc()
+				if MetricsEnabled() {
+					BlockedRequests.WithLabelValues("L7", "cmd_injection").Inc()
+				}
 				http.Error(w, "Malicious request detected", http.StatusBadRequest)
 				return
 			}
 
 			if traversal.MatchString(p) {
 				logger.Warn("Blocked path traversal attempt", "remote_addr", r.RemoteAddr, "payload", p)
-				BlockedRequests.WithLabelValues("L7", "traversal").Inc()
+				if MetricsEnabled() {
+					BlockedRequests.WithLabelValues("L7", "traversal").Inc()
+				}
 				http.Error(w, "Malicious request detected", http.StatusBadRequest)
 				return
 			}

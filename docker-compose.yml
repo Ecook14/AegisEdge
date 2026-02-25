@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  aegisedge:
+    build: .
+    ports:
+      - "80:80"
+      - "443:443"
+      - "9090:9090"   # Prometheus metrics
+      - "9091:9091"   # Management API
+    environment:
+      - AEGISEDGE_PORTS=80,443
+      - AEGISEDGE_UPSTREAM=http://demo:3000
+      - AEGISEDGE_REDIS_ADDR=redis:6379
+      - AEGISEDGE_LOG_LEVEL=INFO
+      - AEGISEDGE_SECRET=change-me-in-production
+      # - AEGISEDGE_API_KEY=your-secret-api-key
+      # - AEGISEDGE_WEBHOOK_URL=https://hooks.slack.com/services/...
+      # - AEGISEDGE_GEOIP_DB=GeoLite2-Country.mmdb
+      # - AEGISEDGE_BLOCKED_COUNTRIES=CN,RU,KP
+    depends_on:
+      - redis
+      - demo
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN   # Required for iptables/kernel-level blocking
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+volumes:
+  redis_data:

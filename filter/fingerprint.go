@@ -1,59 +1,76 @@
 package filter
 
 import (
-	"crypto/md5"
-	"encoding/hex"
+	"fmt"
+	"hash/fnv"
 	"net/http"
 	"sync"
 
 	"aegisedge/logger"
 )
 
-// botScore thresholds
-const (
-	botScoreBlock = 4 // score >= this means auto-block the fingerprint
-)
+const fingerprintShards = 64
+
+type fingerprintShard struct {
+	mu                  sync.RWMutex
+	blockedFingerprints map[string]bool
+	fingerprintScores   map[string]int
+}
 
 // Fingerprinter identifies clients based on HTTP header signatures.
-// It also auto-scores requests for bot-like behavior and blocks high-scoring fingerprints.
+// It uses a 64-shard lock architecture and FNV-1a hashing for 10k+ RPS efficiency.
 type Fingerprinter struct {
-	mu                  sync.RWMutex
-	BlockedFingerprints map[string]bool
-	// fingerprintScores tracks cumulative bot scores per fingerprint hash
-	// to auto-block fingerprints that consistently look like bots.
-	fingerprintScores map[string]int
+	shards     [fingerprintShards]*fingerprintShard
+	botScanner *BotScanner
 }
 
 func NewFingerprinter() *Fingerprinter {
-	return &Fingerprinter{
-		BlockedFingerprints: make(map[string]bool),
-		fingerprintScores:   make(map[string]int),
+	f := &Fingerprinter{
+		botScanner: NewBotScanner(),
 	}
+	for i := 0; i < fingerprintShards; i++ {
+		f.shards[i] = &fingerprintShard{
+			blockedFingerprints: make(map[string]bool),
+			fingerprintScores:   make(map[string]int),
+		}
+	}
+	return f
 }
+
+func (f *Fingerprinter) getShard(fp string) *fingerprintShard {
+	// FNV-1a is extremely fast and effective for short header strings
+	h := fnv.New32a()
+	h.Write([]byte(fp))
+	return f.shards[h.Sum32()%fingerprintShards]
+}
+
+const botScoreBlock = 4
 
 func (f *Fingerprinter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fp := f.calculateFingerprint(r)
 		score := f.scoreRequest(r)
 
-		f.mu.Lock()
-		// Accumulate score for this fingerprint
-		f.fingerprintScores[fp] += score
-		accumulated := f.fingerprintScores[fp]
+		shard := f.getShard(fp)
+		shard.mu.Lock()
+		
+		shard.fingerprintScores[fp] += score
+		accumulated := shard.fingerprintScores[fp]
 
-		// Auto-block fingerprints with consistently bot-like behavior
-		if accumulated >= botScoreBlock && !f.BlockedFingerprints[fp] {
-			f.BlockedFingerprints[fp] = true
+		if accumulated >= botScoreBlock && !shard.blockedFingerprints[fp] {
+			shard.blockedFingerprints[fp] = true
 			logger.Warn("Auto-blocked bot fingerprint", "fingerprint", fp,
 				"score", accumulated, "remote_addr", r.RemoteAddr,
 				"user_agent", r.Header.Get("User-Agent"))
 		}
 
-		blocked := f.BlockedFingerprints[fp]
-		f.mu.Unlock()
+		blocked := shard.blockedFingerprints[fp]
+		shard.mu.Unlock()
 
 		if blocked {
-			BlockedRequests.WithLabelValues("L7", "fingerprint").Inc()
+			if MetricsEnabled() {
+				BlockedRequests.WithLabelValues("L7", "fingerprint").Inc()
+			}
 			http.Error(w, "Access Denied: Malicious Signature", http.StatusForbidden)
 			return
 		}
@@ -67,7 +84,12 @@ func (f *Fingerprinter) Middleware(next http.Handler) http.Handler {
 func (f *Fingerprinter) scoreRequest(r *http.Request) int {
 	score := 0
 
-	// Missing Accept header is a strong bot signal — real browsers always send it
+	// High-Performance Bot Signature Check
+	if f.botScanner.IsBot(r.Header.Get("User-Agent")) {
+		score += 3
+	}
+
+	// Missing Accept header is a strong bot signal
 	if r.Header.Get("Accept") == "" {
 		score += 2
 	}
@@ -105,21 +127,21 @@ func (f *Fingerprinter) calculateFingerprint(r *http.Request) string {
 		"Sec-Fetch-User",
 	}
 
-	var data []byte
-	for _, h := range fingerprintHeaders {
-		val := r.Header.Get(h)
+	h := fnv.New64a()
+	for _, header := range fingerprintHeaders {
+		val := r.Header.Get(header)
 		if val == "" {
 			val = "missing"
 		}
-		data = append(data, []byte(h+":"+val+"|")...)
+		h.Write([]byte(header + ":" + val + "|"))
 	}
 
-	hash := md5.Sum(data)
-	return hex.EncodeToString(hash[:])
+	return fmt.Sprintf("%x", h.Sum64())
 }
 
 func (f *Fingerprinter) BlockFingerprint(fp string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.BlockedFingerprints[fp] = true
+	shard := f.getShard(fp)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.blockedFingerprints[fp] = true
 }

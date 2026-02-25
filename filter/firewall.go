@@ -1,5 +1,3 @@
-// This file is intentionally empty.
-// Kernel-level firewall blocking is implemented in orchestration_firewall.go via BlockIPKernel.
-// Use BlockIPKernel(ip) for iptables/netsh integration (supports both Linux and Windows).
-// BlockIP (Linux-only) has been consolidated into BlockIPKernel for cross-platform support.
+// Deprecated: this file is intentionally left empty.
+// All firewall operations are in orchestration_firewall.go.
 package filter

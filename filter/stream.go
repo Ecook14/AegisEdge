@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"aegisedge/logger"
@@ -40,7 +42,19 @@ func handleStream(conn net.Conn, targetAddr string, l4 *L4Filter) {
 	}
 	defer l4.ReleaseConnection(realAddr)
 
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// Mark packets on Linux/WSL only (SO_MARK = 36)
+				if runtime.GOOS == "linux" {
+					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 36, 0xAE615)
+				}
+			})
+		},
+	}
+
+	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		logger.Error("Stream proxy dial error", "addr", targetAddr, "err", err)
 		return

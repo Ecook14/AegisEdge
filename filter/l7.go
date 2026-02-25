@@ -12,24 +12,45 @@ import (
 )
 
 
-// L7Filter enforces per-IP Token Bucket rate limiting using golang.org/x/time/rate.
-// Each IP gets its own bucket; stale entries are purged every 5 minutes.
+const numShards = 64
+
+type limiterEntry struct {
+	limiter    *rate.Limiter
+	multiplier float64
+	lastUpdate time.Time
+}
+
+type shard struct {
+	mu       sync.RWMutex
+	limiters map[string]*limiterEntry
+	lastSeen map[string]time.Time
+}
+
+// L7Filter enforces per-IP Token Bucket rate limiting with sharded locks for 10k+ RPS scale.
 type L7Filter struct {
-	mu           sync.RWMutex
-	limiters     map[string]*rate.Limiter
-	lastSeen     map[string]time.Time
+	shards       [numShards]*shard
+	Whitelist    map[string]bool
 	DefaultRate  float64
 	DefaultBurst int
 	stop         chan struct{}
 }
 
-func NewL7Filter(rateLimit float64, burstLimit int, _ interface{}) *L7Filter {
+func NewL7Filter(rateLimit float64, burstLimit int, whitelist []string) *L7Filter {
+	wl := make(map[string]bool)
+	for _, ip := range whitelist {
+		wl[ip] = true
+	}
 	f := &L7Filter{
-		limiters:     make(map[string]*rate.Limiter),
-		lastSeen:     make(map[string]time.Time),
+		Whitelist:    wl,
 		DefaultRate:  rateLimit,
 		DefaultBurst: burstLimit,
 		stop:         make(chan struct{}),
+	}
+	for i := 0; i < numShards; i++ {
+		f.shards[i] = &shard{
+			limiters: make(map[string]*limiterEntry),
+			lastSeen: make(map[string]time.Time),
+		}
 	}
 	go f.cleanupLoop()
 	return f
@@ -39,36 +60,64 @@ func (f *L7Filter) Stop() {
 	close(f.stop)
 }
 
-// getLimiter returns the token bucket limiter for a given IP, creating one if needed.
-func (f *L7Filter) getLimiter(ip string) *rate.Limiter {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	lim, exists := f.limiters[ip]
-	if !exists {
-		lim = rate.NewLimiter(rate.Limit(f.DefaultRate), f.DefaultBurst)
-		f.limiters[ip] = lim
+func (f *L7Filter) getShard(ip string) *shard {
+	// Simple hash for IP to shard
+	hash := uint32(0)
+	for i := 0; i < len(ip); i++ {
+		hash = 31*hash + uint32(ip[i])
 	}
-	f.lastSeen[ip] = time.Now()
-	return lim
+	return f.shards[hash%numShards]
 }
 
-// cleanupLoop removes stale IP limiters every 5 minutes to prevent unbounded memory growth.
+// getLimiter returns both the limiter and the cached multiplier for an IP.
+func (f *L7Filter) getLimiter(ip string, rep *ReputationManager) (*rate.Limiter, float64) {
+	s := f.getShard(ip)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	entry, exists := s.limiters[ip]
+	
+	if !exists {
+		entry = &limiterEntry{
+			limiter:    rate.NewLimiter(rate.Limit(f.DefaultRate), f.DefaultBurst),
+			multiplier: 1.0,
+			lastUpdate: time.Time{}, // Force immediate update
+		}
+		s.limiters[ip] = entry
+	}
+	s.lastSeen[ip] = now
+
+	// Optimization: Only refresh reputation score every 2 seconds to save store cycles
+	if rep != nil && now.Sub(entry.lastUpdate) > 2*time.Second {
+		entry.multiplier = rep.GetMultiplier(ip)
+		entry.lastUpdate = now
+		entry.limiter.SetLimit(rate.Limit(f.DefaultRate * entry.multiplier))
+		entry.limiter.SetBurst(int(float64(f.DefaultBurst) * entry.multiplier))
+	}
+
+	return entry.limiter, entry.multiplier
+}
+
+// cleanupLoop removes stale entries from all shards concurrently.
 func (f *L7Filter) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			f.mu.Lock()
-			for ip, last := range f.lastSeen {
-				if time.Since(last) > 10*time.Minute {
-					delete(f.limiters, ip)
-					delete(f.lastSeen, ip)
+			for i := 0; i < numShards; i++ {
+				s := f.shards[i]
+				s.mu.Lock()
+				for ip, last := range s.lastSeen {
+					if time.Since(last) > 10*time.Minute {
+						delete(s.limiters, ip)
+						delete(s.lastSeen, ip)
+					}
 				}
+				s.mu.Unlock()
 			}
-			f.mu.Unlock()
-			logger.Info("L7 limiter: stale IP entries purged")
+			logger.Info("L7 limiter: sharded stale IP entries purged")
 		case <-f.stop:
 			return
 		}
@@ -79,34 +128,37 @@ func (f *L7Filter) Middleware(next http.Handler, rep *ReputationManager) http.Ha
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := util.GetRealIP(r)
 
-		multiplier := 1.0
-
-		limiter := f.getLimiter(host)
-
-		// Apply reputation multiplier to the effective rate live.
-		// SetLimit and SetBurst are concurrency-safe in golang.org/x/time/rate.
-		if rep != nil {
-			multiplier = rep.GetMultiplier(host)
-			limiter.SetLimit(rate.Limit(f.DefaultRate * multiplier))
-			limiter.SetBurst(int(float64(f.DefaultBurst) * multiplier))
+		// Whitelist takes absolute precedence
+		if f.Whitelist[host] {
+			next.ServeHTTP(w, r)
+			return
 		}
 
+		limiter, multiplier := f.getLimiter(host, rep)
+
 		if !limiter.AllowN(time.Now(), 1) {
-			logger.Warn("L7 rate limit exceeded (token bucket)", "remote_addr", host,
-				"effective_rate", f.DefaultRate*multiplier, "effective_burst", int(float64(f.DefaultBurst)*multiplier))
+			logger.Warn("L7 rate limit exceeded", "remote_addr", host, "multiplier", multiplier)
 
 			if rep != nil {
 				rep.Penalize(host)
 			}
 
-			BlockedRequests.WithLabelValues("L7", "rate_limit").Inc()
+			if MetricsEnabled() {
+				BlockedRequests.WithLabelValues("L7", "rate_limit").Inc()
+			}
+			IncrementL7Blocks()
+			
+			// Potential "Fast-Path" trigger point for repeat offenders
+			TriggerSoftBlock(host) 
+
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
-		// Reject headless clients with no User-Agent
 		if r.Header.Get("User-Agent") == "" {
-			BlockedRequests.WithLabelValues("L7", "no_user_agent").Inc()
+			if MetricsEnabled() {
+				BlockedRequests.WithLabelValues("L7", "no_user_agent").Inc()
+			}
 			http.Error(w, "Plain bot requests are not allowed", http.StatusForbidden)
 			return
 		}

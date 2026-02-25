@@ -1,11 +1,14 @@
 package filter
 
 import (
+	"sync/atomic"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 var (
+	metricsEnabled atomic.Bool
+
 	BlockedRequests = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "aegisedge_blocked_requests_total",
@@ -29,3 +32,11 @@ var (
 		[]string{"method", "path"},
 	)
 )
+
+func SetMetricsEnabled(v bool) {
+	metricsEnabled.Store(v)
+}
+
+func MetricsEnabled() bool {
+	return metricsEnabled.Load()
+}

@@ -17,28 +17,46 @@ type localCounter struct {
 	expiry time.Time
 }
 
-type LocalStore struct {
-	counters map[string]localCounter
-	blocks   map[string]localBlock
-	data     map[string]localData
-	mu       sync.RWMutex
-	stop     chan struct{}
-}
+const numShards = 64
 
 type localBlock struct {
 	Type   string
 	Expiry time.Time
 }
 
+type storeShard struct {
+	counters map[string]localCounter
+	blocks   map[string]localBlock
+	data     map[string]localData
+	mu       sync.RWMutex
+}
+
+type LocalStore struct {
+	shards [numShards]*storeShard
+	stop   chan struct{}
+}
+
 func NewLocalStore() *LocalStore {
 	s := &LocalStore{
-		counters: make(map[string]localCounter),
-		blocks:   make(map[string]localBlock),
-		data:     make(map[string]localData),
-		stop:     make(chan struct{}),
+		stop: make(chan struct{}),
+	}
+	for i := 0; i < numShards; i++ {
+		s.shards[i] = &storeShard{
+			counters: make(map[string]localCounter),
+			blocks:   make(map[string]localBlock),
+			data:     make(map[string]localData),
+		}
 	}
 	go s.cleanupLoop()
 	return s
+}
+
+func (s *LocalStore) getShard(key string) *storeShard {
+	hash := uint32(0)
+	for i := 0; i < len(key); i++ {
+		hash = 31*hash + uint32(key[i])
+	}
+	return s.shards[hash%numShards]
 }
 
 // Close stops the background cleanup goroutine.
@@ -48,9 +66,10 @@ func (s *LocalStore) Close() error {
 }
 
 func (s *LocalStore) Get(key string) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	d := s.data[key]
+	shard := s.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	d := shard.data[key]
 	if !d.expiry.IsZero() && time.Now().After(d.expiry) {
 		return "", nil // expired
 	}
@@ -58,51 +77,55 @@ func (s *LocalStore) Get(key string) (string, error) {
 }
 
 func (s *LocalStore) Set(key string, val string, expiration time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 	expiry := time.Time{}
 	if expiration > 0 {
 		expiry = time.Now().Add(expiration)
 	}
-	s.data[key] = localData{value: val, expiry: expiry}
+	shard.data[key] = localData{value: val, expiry: expiry}
 	return nil
 }
 
 func (s *LocalStore) Increment(key string, expiration time.Duration) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	c := s.counters[key]
+	c := shard.counters[key]
 	// Only set the expiry on the first increment for this key (new window).
-	// Subsequent increments within the window extend nothing — correct sliding window behaviour.
 	if c.count == 0 && expiration > 0 {
 		c.expiry = time.Now().Add(expiration)
 	}
 	c.count++
-	s.counters[key] = c
+	shard.counters[key] = c
 	return c.count, nil
 }
 
 func (s *LocalStore) Decrement(key string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.counters[key]
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	c := shard.counters[key]
 	c.count--
-	s.counters[key] = c
+	shard.counters[key] = c
 	return c.count, nil
 }
 
 func (s *LocalStore) GetCounter(key string) (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.counters[key].count, nil
+	shard := s.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.counters[key].count, nil
 }
 
 func (s *LocalStore) IsBlocked(key string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	shard := s.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 	
-	block, ok := s.blocks[key]
+	block, ok := shard.blocks[key]
 	if !ok {
 		return false
 	}
@@ -115,36 +138,40 @@ func (s *LocalStore) IsBlocked(key string) bool {
 }
 
 func (s *LocalStore) Block(key string, expiration time.Duration, blockType string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 	
 	expiry := time.Time{}
 	if expiration > 0 {
 		expiry = time.Now().Add(expiration)
 	}
 	
-	s.blocks[key] = localBlock{
+	shard.blocks[key] = localBlock{
 		Type:   blockType,
 		Expiry: expiry,
 	}
 }
 
 func (s *LocalStore) Unblock(key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.blocks, key)
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	delete(shard.blocks, key)
 	return nil
 }
 
 func (s *LocalStore) ListBlocks() (map[string]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	
 	res := make(map[string]string)
-	for k, v := range s.blocks {
-		if v.Expiry.IsZero() || time.Now().Before(v.Expiry) {
-			res[k] = v.Type
+	for i := 0; i < numShards; i++ {
+		shard := s.shards[i]
+		shard.mu.RLock()
+		for k, v := range shard.blocks {
+			if v.Expiry.IsZero() || time.Now().Before(v.Expiry) {
+				res[k] = v.Type
+			}
 		}
+		shard.mu.RUnlock()
 	}
 	return res, nil
 }
@@ -155,27 +182,30 @@ func (s *LocalStore) cleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.mu.Lock()
 			now := time.Now()
-			// Evict expired blocks
-			for k, v := range s.blocks {
-				if !v.Expiry.IsZero() && now.After(v.Expiry) {
-					delete(s.blocks, k)
+			for i := 0; i < numShards; i++ {
+				shard := s.shards[i]
+				shard.mu.Lock()
+				// Evict expired blocks
+				for k, v := range shard.blocks {
+					if !v.Expiry.IsZero() && now.After(v.Expiry) {
+						delete(shard.blocks, k)
+					}
 				}
-			}
-			// Evict expired counters (windows that have closed)
-			for k, c := range s.counters {
-				if !c.expiry.IsZero() && now.After(c.expiry) {
-					delete(s.counters, k)
+				// Evict expired counters
+				for k, c := range shard.counters {
+					if !c.expiry.IsZero() && now.After(c.expiry) {
+						delete(shard.counters, k)
+					}
 				}
-			}
-			// Evict expired data entries
-			for k, d := range s.data {
-				if !d.expiry.IsZero() && now.After(d.expiry) {
-					delete(s.data, k)
+				// Evict expired data entries
+				for k, d := range shard.data {
+					if !d.expiry.IsZero() && now.After(d.expiry) {
+						delete(shard.data, k)
+					}
 				}
+				shard.mu.Unlock()
 			}
-			s.mu.Unlock()
 		case <-s.stop:
 			return
 		}

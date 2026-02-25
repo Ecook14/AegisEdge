@@ -12,9 +12,10 @@ import (
 // It re-discovers from CSF, cPHulk, and iptables on a configurable interval
 // and supports on-demand reloads via Reload().
 type ProxyWatcher struct {
-	nets   atomic.Value  // stores []*net.IPNet — lock-free reads per request
-	manual []string      // static entries from env / API calls
-	mu     sync.Mutex    // guards manual slice and Reload()
+	nets   atomic.Value // stores []*net.IPNet — for CIDR matching
+	cache  atomic.Value // stores map[string]bool — fast-path for exact IP matches
+	manual []string     // static entries from env / API calls
+	mu     sync.Mutex   // guards manual slice and Reload()
 	stop   chan struct{}
 }
 
@@ -24,6 +25,10 @@ func NewProxyWatcher(manualList string, interval time.Duration) *ProxyWatcher {
 	w := &ProxyWatcher{
 		stop: make(chan struct{}),
 	}
+	// Initialize with empty maps to avoid nil checks on hot path
+	w.cache.Store(make(map[string]bool))
+	w.nets.Store([]*net.IPNet{})
+
 	// Parse static manual entries once.
 	for _, e := range strings.Split(manualList, ",") {
 		e = strings.TrimSpace(e)
@@ -42,6 +47,13 @@ func NewProxyWatcher(manualList string, interval time.Duration) *ProxyWatcher {
 // IsTrusted returns true if ip is within any currently trusted network.
 // Uses atomic load — zero contention on the hot path.
 func (w *ProxyWatcher) IsTrusted(ipStr string) bool {
+	// Fast-Path: Check string cache first (Zero allocation, O(1))
+	cache, _ := w.cache.Load().(map[string]bool)
+	if cache[ipStr] {
+		return true
+	}
+
+	// Slow-Path: Parse and CIDR match
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
@@ -95,7 +107,29 @@ func (w *ProxyWatcher) reload() {
 	entries := make([]string, 0, len(w.manual))
 	entries = append(entries, w.manual...)
 	entries = append(entries, DiscoverTrustedProxies()...)
-	w.nets.Store(parseTrustedList(entries))
+
+	nets := parseTrustedList(entries)
+	w.nets.Store(nets)
+
+	// Rebuild string cache for exact IPs
+	cache := make(map[string]bool)
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// If it's a single IP (no mask), add to cache
+		if !strings.Contains(entry, "/") {
+			cache[entry] = true
+		} else {
+			// If it's a /32 or /128 CIDR, add the IP part to cache too
+			if strings.HasSuffix(entry, "/32") || strings.HasSuffix(entry, "/128") {
+				parts := strings.Split(entry, "/")
+				cache[parts[0]] = true
+			}
+		}
+	}
+	w.cache.Store(cache)
 }
 
 func (w *ProxyWatcher) loop(interval time.Duration) {

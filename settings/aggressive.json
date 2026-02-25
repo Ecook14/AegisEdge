@@ -1,0 +1,27 @@
+{
+    "listen_ports": [
+        443,
+        8080,
+        3000
+    ],
+    "tcp_ports": [
+        21,
+        22
+    ],
+    "whitelist": [
+        "127.0.0.1"
+    ],
+    "hot_takeover": true,
+    "l4_conn_limit": 3,
+    "l7_rate_limit": 1.0,
+    "l7_burst_limit": 5,
+    "log_level": "INFO",
+    "hypervisor_mode": false,
+    "toggles": {
+        "waf": true,
+        "geoip": true,
+        "challenge": true,
+        "anomaly": true,
+        "stats": true
+    }
+}

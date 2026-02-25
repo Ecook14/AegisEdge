@@ -46,7 +46,7 @@ func buildURL(base, mode string) string {
 }
 
 func main() {
-	target := flag.String("target", "http://localhost:8080", "Target URL to test")
+	target := flag.String("target", "http://127.0.0.1:3000", "Target URL to test (App Port: 3000, Live: 80/443)")
 	concurrency := flag.Int("c", 10, "Concurrency level (parallel goroutines)")
 	requests := flag.Int("n", 100, "Total number of requests")
 	mode := flag.String("mode", "clean", "Test mode: clean|sqli|xss|cmd|traversal|challenge|bot|flood")
@@ -63,6 +63,9 @@ func main() {
 	fmt.Printf("╚══════════════════════════════════════════════════╝\n")
 	fmt.Printf("  Target:      %s\n", *target)
 	fmt.Printf("  Mode:        %s\n", *mode)
+	if *target == "http://127.0.0.1:3000" || *target == "http://127.0.0.1:80" || *target == "http://127.0.0.1:443" {
+		fmt.Printf("  Notice:      Shield (Proxy) is active if Hot Takeover is enabled.\n")
+	}
 	fmt.Printf("  Payload:     %s\n", info.description)
 	fmt.Printf("  Expected:    %s\n", info.expected)
 
@@ -161,7 +164,7 @@ func runFlood(target string) {
 		}()
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(80 * time.Second)
 	close(done)
 	time.Sleep(200 * time.Millisecond) // let goroutines drain
 	close(results)

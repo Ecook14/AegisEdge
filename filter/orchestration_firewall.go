@@ -71,8 +71,17 @@ func TakeoverPort(occupiedPort, internalPort int) error {
 			fmt.Sprintf("listenport=%d", occupiedPort), "listenaddress=0.0.0.0", 
 			fmt.Sprintf("connectport=%d", internalPort), "connectaddress=127.0.0.1")
 	} else {
-		// iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8888
-		cmd = exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", 
+		// Linux/WSL: PREROUTING for external traffic, OUTPUT for locally generated traffic (localhost)
+		out1, err1 := exec.Command("iptables", "-t", "nat", "-I", "PREROUTING", "-p", "tcp", 
+			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort)).CombinedOutput()
+		if err1 != nil {
+			logger.Warn("Failed to add PREROUTING rule", "port", occupiedPort, "err", err1, "output", string(out1))
+		}
+		
+		// Use -m mark ! --mark 0xAE615 to prevent AegisEdge from redirecting its own outgoing traffic back to itself (infinite loop)
+		// This is safer than UID-based matching when tools are run as the same user (e.g. root)
+		cmd = exec.Command("iptables", "-t", "nat", "-I", "OUTPUT", "-p", "tcp", "-o", "lo",
+			"-m", "mark", "!", "--mark", "0xAE615",
 			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort))
 	}
 
@@ -92,7 +101,10 @@ func ReleasePort(occupiedPort, internalPort int) error {
 		cmd = exec.Command("netsh", "interface", "portproxy", "delete", "v4tov4", 
 			fmt.Sprintf("listenport=%d", occupiedPort), "listenaddress=0.0.0.0")
 	} else {
-		cmd = exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", 
+		exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", 
+			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort)).Run()
+		cmd = exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-o", "lo",
+			"-m", "mark", "!", "--mark", "0xAE615",
 			"--dport", fmt.Sprintf("%d", occupiedPort), "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", internalPort))
 	}
 

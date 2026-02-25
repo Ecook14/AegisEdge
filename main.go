@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -22,10 +24,16 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	pprof_handler "net/http/pprof"
 )
 
 func main() {
-	logger.SetLevel(os.Getenv("AEGISEDGE_LOG_LEVEL"))
+	// Runtime Tuning: Reduce GC frequency (200% = run GC half as often)
+	// Trades ~2x memory for significantly lower CPU at high allocation rates.
+	debug.SetGCPercent(200)
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	configPath := "config.json"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
@@ -35,6 +43,11 @@ func main() {
 	if err != nil {
 		logger.Error("Failed to load config", "err", err)
 		os.Exit(1)
+	}
+
+	// Apply configured log level if not overridden by env var
+	if os.Getenv("AEGISEDGE_LOG_LEVEL") == "" && cfg.LogLevel != "" {
+		logger.SetLevel(cfg.LogLevel)
 	}
 
 	logger.Info("Starting AegisEdge", "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
@@ -53,9 +66,9 @@ func main() {
 	rep := filter.NewReputationManager(activeStore)
 
 	// Initialize Filters
-	l3 := filter.NewL3Filter(cfg.L3Blacklist)
-	l4 := filter.NewL4Filter(cfg.L4ConnLimit, 5*time.Minute, activeStore)
-	l7 := filter.NewL7Filter(cfg.L7RateLimit, cfg.L7BurstLimit, activeStore)
+	l3 := filter.NewL3Filter(cfg.L3Blacklist, cfg.Whitelist)
+	l4 := filter.NewL4Filter(cfg.L4ConnLimit, 5*time.Minute, activeStore, cfg.Whitelist)
+	l7 := filter.NewL7Filter(cfg.L7RateLimit, cfg.L7BurstLimit, cfg.Whitelist)
 	geoip := filter.NewGeoIPFilter(cfg.GeoIPDBPath, cfg.BlockedCountries)
 	fingerprinter := filter.NewFingerprinter()
 	anomaly := filter.NewAnomalyDetector([]string{"/search", "/api/heavy-export"}, 20, activeStore)
@@ -90,43 +103,103 @@ func main() {
 	// activeConns is an atomic counter for real load-aware challenge gating.
 	var activeConns int64
 
-	// Orchestration check & OS Hardening
-	filter.CheckAnsibleThresholds()
+	// Orchestration monitor & OS Hardening
+	orchMonitor := filter.NewOrchestrationMonitor()
+	orchMonitor.Start()
 	filter.HardenOS()
 
-	// Initialize Proxy
-	p, err := proxy.NewReverseProxy(cfg.UpstreamAddr)
+	// Initialize Proxies (Default + Port-Specific)
+	proxies := make(map[int]*proxy.ReverseProxy)
+	defaultProxy, err := proxy.NewReverseProxy(cfg.UpstreamAddr)
 	if err != nil {
-		logger.Error("Failed to initialize proxy", "err", err)
+		logger.Error("Failed to initialize default proxy", "err", err)
 		os.Exit(1)
 	}
+
+	for portStr, target := range cfg.UpstreamMap {
+		var pNum int
+		fmt.Sscanf(portStr, "%d", &pNum)
+		if prx, err := proxy.NewReverseProxy(target); err == nil {
+			proxies[pNum] = prx
+			logger.Info("Specialized upstream from map", "port", pNum, "target", target)
+		}
+	}
+
+	// Zero-Config: For any listen_port NOT in the map, assume local loopback
+	for _, port := range cfg.ListenPorts {
+		if _, exists := proxies[port]; !exists {
+			protocol := "http"
+			if port == 443 {
+				protocol = "https"
+			}
+			target := fmt.Sprintf("%s://127.0.0.1:%d", protocol, port)
+			if prx, err := proxy.NewReverseProxy(target); err == nil {
+				proxies[port] = prx
+				logger.Info("Zero-Config upstream auto-discovery", "port", port, "target", target)
+			}
+		}
+	}
+
+	// ProxyWatcher: auto-discovers from CSF/cPHulk/iptables and merges with
+	// the manual AEGISEDGE_TRUSTED_PROXY env var. Refreshes every 5 minutes.
+	proxyWatcher := util.NewProxyWatcher(os.Getenv("AEGISEDGE_TRUSTED_PROXY"), 5*time.Minute)
+	logger.Info("Trusted proxy watcher started", "refresh_interval", "5m")
+
+	// Management API Instance
+	mgmt := manager.NewManagementAPI(activeStore, toggles, proxyWatcher)
 
 	// finalHandler: L3/L4 gate + Prometheus metrics + upstream proxy
 	finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := util.GetRealIP(r)
+		mgmt.TrackRequest()
+
+		// Developer Whitelist Bypass (Absolute Precedence)
+		if l3.IsWhitelisted(host) {
+			// Skip all security layers and go straight to proxy
+			goto proceedToProxy
+		}
 
 		// Layer 3 (Centralized Block Check)
 		if activeStore.IsBlocked(host) {
-			filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
+			logger.Warn("Blocked request: IP is in active block list", "remote_addr", host)
+			if toggles.IsEnabled("stats") {
+				filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
+			}
 			http.Error(w, "Access Denied (Active Block)", http.StatusForbidden)
 			return
 		}
 
 		if l3.IsBlacklisted(host) {
-			filter.BlockedRequests.WithLabelValues("L3", "blacklist").Inc()
+			logger.Warn("Blocked request: IP is blacklisted", "remote_addr", host)
+			if toggles.IsEnabled("stats") {
+				filter.BlockedRequests.WithLabelValues("L3", "blacklist").Inc()
+			}
 			http.Error(w, "Access Denied", http.StatusForbidden)
 			return
 		}
 
 		// Layer 4
 		if !l4.AllowConnection(r.RemoteAddr) {
-			filter.BlockedRequests.WithLabelValues("L4", "conn_limit").Inc()
+			if toggles.IsEnabled("stats") {
+				filter.BlockedRequests.WithLabelValues("L4", "conn_limit").Inc()
+			}
 			http.Error(w, "Too many connections", http.StatusServiceUnavailable)
 			return
 		}
 		defer l4.ReleaseConnection(r.RemoteAddr)
 
-		p.ServeHTTP(w, r)
+	proceedToProxy:
+		// Dynamic Routing: Choose the upstream based on the port in the context
+		targetProxy := defaultProxy
+		if pVal := r.Header.Get("X-Aegis-Port"); pVal != "" {
+			var port int
+			fmt.Sscanf(pVal, "%d", &port)
+			if specialized, exists := proxies[port]; exists {
+				targetProxy = specialized
+			}
+		}
+
+		targetProxy.ServeHTTP(w, r)
 	})
 
 
@@ -147,15 +220,18 @@ func main() {
 	// attackChallenge: the outermost per-request decision gate.
 	// Force challenge when:  (a) Z-Score anomaly detected, or (b) real concurrent load > 200.
 	attackChallenge := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Outermost Load Tracking: Capture every request as it hits the security engine
-		filter.ActiveConnections.Inc()
-		defer filter.ActiveConnections.Dec()
-
+		// Outermost Load Tracking: Atomic core count is very fast, required for challenge logic
 		atomic.AddInt64(&activeConns, 1)
 		defer atomic.AddInt64(&activeConns, -1)
 
-		timer := prometheus.NewTimer(filter.RequestLatency.WithLabelValues(r.Method, r.URL.Path))
-		defer timer.ObserveDuration()
+		// Prometheus Metrics: Gated behind "stats" toggle for 10k+ RPS efficiency
+		if toggles.IsEnabled("stats") {
+			filter.ActiveConnections.Inc()
+			defer filter.ActiveConnections.Dec()
+
+			timer := prometheus.NewTimer(filter.RequestLatency.WithLabelValues(r.Method, r.URL.Path))
+			defer timer.ObserveDuration()
+		}
 
 		isUnderAttack := stats.IsUnderAttack()
 		isHighLoad := atomic.LoadInt64(&activeConns) > 200
@@ -167,16 +243,47 @@ func main() {
 		}
 	})
 
-	// ProxyWatcher: auto-discovers from CSF/cPHulk/iptables and merges with
-	// the manual AEGISEDGE_TRUSTED_PROXY env var. Refreshes every 5 minutes.
-	proxyWatcher := util.NewProxyWatcher(os.Getenv("AEGISEDGE_TRUSTED_PROXY"), 5*time.Minute)
-	logger.Info("Trusted proxy watcher started", "refresh_interval", "5m")
-
 	// RealIP is the outermost layer — resolves the actual client IP from proxy
 	// headers before any filter or middleware runs. List is updated live.
-	stack := middleware.RealIP(proxyWatcher)(
-		middleware.SecurityHeaders(attackChallenge),
+	securityStack := middleware.RealIP(proxyWatcher)(
+		middleware.RequestLogger(
+			middleware.SecurityHeaders(attackChallenge),
+		),
 	)
+
+	// Fast-Reject Gate: The ABSOLUTE outermost handler.
+	// Checks if an IP is already known-bad BEFORE entering ANY middleware.
+	// This saves 8 middleware layers of CPU for every blocked request.
+	stack := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Extract raw IP directly (RealIP middleware hasn't run yet)
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+		// Ultra-fast path: If already soft-blocked by fingerprinter, reject instantly
+		if filter.IsSoftBlocked(host) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		// Check active block list (sharded store, very fast)
+		if activeStore.IsBlocked(host) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		securityStack.ServeHTTP(w, r)
+	})
+
+	// pprof endpoint for CPU profiling (http://localhost:6060/debug/pprof/)
+	go func() {
+		import_pprof_mux := http.NewServeMux()
+		import_pprof_mux.HandleFunc("/debug/pprof/", pprof_handler.Index)
+		import_pprof_mux.HandleFunc("/debug/pprof/cmdline", pprof_handler.Cmdline)
+		import_pprof_mux.HandleFunc("/debug/pprof/profile", pprof_handler.Profile)
+		import_pprof_mux.HandleFunc("/debug/pprof/symbol", pprof_handler.Symbol)
+		import_pprof_mux.HandleFunc("/debug/pprof/trace", pprof_handler.Trace)
+		logger.Info("pprof profiling active", "port", 6060)
+		http.ListenAndServe(":6060", import_pprof_mux)
+	}()
 
 	// Metrics endpoint
 	go func() {
@@ -189,10 +296,9 @@ func main() {
 	// Management API (Protected/Internal) — wired with LiveToggles for real-time config
 	go func() {
 		mux := http.NewServeMux()
-		mgmt := manager.NewManagementAPI(activeStore, toggles, proxyWatcher)
 		mgmt.ServeHTTP(mux)
 		logger.Info("Management API active", "port", 9091)
-		http.ListenAndServe(":9091", mux)
+		http.ListenAndServe(":9091", manager.APIKeyAuth(mux))
 	}()
 
 	// Initialize Servers for all configured ports
@@ -211,7 +317,7 @@ func main() {
 
 		srv := &http.Server{
 			Addr:              addr,
-			Handler:           stack,
+			Handler:           WithPortInfo(port)(stack),
 			ReadHeaderTimeout: 2 * time.Second,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      15 * time.Second,
@@ -319,6 +425,7 @@ func main() {
 	// Stop background cleanup loops and refresh goroutines
 	l7.Stop()
 	proxyWatcher.Stop()
+	orchMonitor.Stop()
 	if ls, ok := activeStore.(*store.LocalStore); ok {
 		ls.Close()
 	}
@@ -338,4 +445,15 @@ func main() {
 	wg.Wait()
 
 	logger.Info("All servers stopped gracefully")
+}
+
+// WithPortInfo wraps an http.Handler to inject the port into the headers.
+func WithPortInfo(port int) func(http.Handler) http.Handler {
+	portStr := fmt.Sprintf("%d", port)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Set("X-Aegis-Port", portStr)
+			next.ServeHTTP(w, r)
+		})
+	}
 }

@@ -11,19 +11,36 @@ import (
 type L4Filter struct {
 	MaxConnPerIP int
 	IdleTimeout  time.Duration
+	Whitelist    map[string]bool
 	store        store.Storer
 }
 
-func NewL4Filter(maxConn int, idleTimeout time.Duration, s store.Storer) *L4Filter {
+func NewL4Filter(maxConn int, idleTimeout time.Duration, s store.Storer, whitelist []string) *L4Filter {
+	wl := make(map[string]bool)
+	for _, ip := range whitelist {
+		wl[ip] = true
+	}
 	return &L4Filter{
 		MaxConnPerIP: maxConn,
 		IdleTimeout:  idleTimeout,
+		Whitelist:    wl,
 		store:        s,
 	}
 }
 
 func (f *L4Filter) AllowConnection(addr string) bool {
+	// Performance Bypass: If limit is 0, skip all tracking and locks
+	if f.MaxConnPerIP <= 0 {
+		return true
+	}
+
 	host, _, _ := net.SplitHostPort(addr)
+	
+	// Whitelist takes absolute precedence
+	if f.Whitelist[host] {
+		return true
+	}
+
 	key := "l4:conn:" + host
 
 	count, err := f.store.Increment(key, f.IdleTimeout)
@@ -40,6 +57,11 @@ func (f *L4Filter) AllowConnection(addr string) bool {
 }
 
 func (f *L4Filter) ReleaseConnection(addr string) {
+	// Performance Bypass: If limit is 0, skip all tracking and locks
+	if f.MaxConnPerIP <= 0 {
+		return
+	}
+
 	host, _, _ := net.SplitHostPort(addr)
 	key := "l4:conn:" + host
 	
