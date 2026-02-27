@@ -19,7 +19,10 @@ func TestL4Filter(t *testing.T) {
 		t.Error("Initial connection should be allowed")
 	}
 	
-	count, _ := s.GetCounter("l4:conn:" + ip)
+	count, err := s.GetCounter("l4:conn:" + ip)
+	if err != nil {
+		t.Fatalf("GetCounter failed: %v", err)
+	}
 	if count != 1 {
 		t.Errorf("Expected 1 connection in store for %s, got %d", ip, count)
 	}
@@ -33,7 +36,10 @@ func TestL4Filter(t *testing.T) {
 	}
 
 	f.ReleaseConnection(addr)
-	count, _ = s.GetCounter("l4:conn:" + ip)
+	count, err = s.GetCounter("l4:conn:" + ip)
+	if err != nil {
+		t.Fatalf("GetCounter failed: %v", err)
+	}
 	if count != 1 {
 		t.Errorf("Expected 1 connection after release, got %d", count)
 	}

@@ -1,6 +1,6 @@
 module aegisedge
 
-go 1.21
+go 1.22
 
 require (
 	github.com/oschwald/geoip2-golang v1.13.0
