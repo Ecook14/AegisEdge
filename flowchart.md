@@ -1,3 +1,4 @@
+```mermaid
 graph TD
     %% ================================
     %% Root Architecture
@@ -82,3 +83,4 @@ graph TD
         AD -.-> C
         AE -.-> U
     end
+```
