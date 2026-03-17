@@ -1,51 +1,66 @@
 graph TD
+    %% ================================
+    %% Root Architecture
+    %% ================================
     subgraph "AegisEdge Security Proxy Architecture"
-        A["main.go<br>Entry Point"] --> B["Configuration<br>config.go"]
-        A --> C["Logging<br>logger/logger.go"]
-        A --> D["Storage<br>store/"]
-        A --> E["Security Pipeline<br>Layered Middleware"]
-
+        A["main.go<br><b>Entry Point</b>"] --> B["config.go<br><b>Configuration Loader</b>"]
+        A --> C["logger/logger.go<br><b>Logger Init</b>"]
+        A --> D["store/<br><b>State & Persistence</b>"]
+        A --> E["<b>Security Pipeline</b><br>Layered Middleware"]
+        %% ======================================
+        %% PIPELINE: Fast Rejection (L3/L4)
+        %% ======================================
         subgraph "Pipeline: Fast Rejection & L3/L4"
-            E --> F["Fast-Reject Gate<br>filter/l3.go, filter/fastpath.go"]
-            F --> G["Real IP Resolution<br>middleware/realip.go<br>util/proxywatcher.go"]
+            E --> F["filter/l3.go, fastpath.go<br><b>Fast-Reject Gate</b>"]
+            F --> G["middleware/realip.go<br>util/proxywatcher.go<br><b>Real IP Resolution</b>"]
         end
-
+        %% ======================================
+        %% PIPELINE: L7 Layers
+        %% ======================================
         subgraph "Pipeline: L7 Security Layers"
-            G --> H["Security Headers<br>middleware/security.go"]
-            H --> I["Challenge/Verification<br>middleware/challenge.go"]
-            I --> J["WAF<br>filter/waf.go"]
-            J --> K["Rate Limiting<br>filter/l7.go"]
-            K --> L["GeoIP Filtering<br>filter/geoip.go"]
-            L --> M["Behavioral Fingerprinting<br>filter/fingerprint.go"]
-            M --> N["Statistical Anomaly Detection<br>filter/statistical.go"]
-            N --> O["Reputation Engine<br>filter/reputation.go"]
+            G --> H["middleware/security.go<br><b>Security Headers</b>"]
+            H --> I["middleware/challenge.go<br><b>Challenge / Bot Verification</b>"]
+            I --> J["filter/waf.go<br><b>WAF</b>"]
+            J --> K["filter/l7.go<br><b>Rate Limiting</b>"]
+            K --> L["filter/geoip.go<br><b>GeoIP Filtering</b>"]
+            L --> M["filter/fingerprint.go<br><b>Behavioral Fingerprinting</b>"]
+            M --> N["filter/statistical.go<br><b>Statistical Anomaly Detection</b>"]
+            N --> O["filter/reputation.go<br><b>Reputation Engine</b>"]
         end
-
-        O --> P["Logging<br>middleware/logger.go"]
-        O --> Q["Metrics<br>filter/metrics.go"]
-        O --> R["Reverse Proxy<br>proxy.NewReverseProxy"]
-
+        %% ======================================
+        %% Post-Pipeline Routing
+        %% ======================================
+        O --> P["middleware/logger.go<br><b>Request Logging</b>"]
+        O --> Q["filter/metrics.go<br><b>Metrics Collection</b>"]
+        O --> R["proxy.NewReverseProxy<br><b>Upstream Reverse Proxy</b>"]
+        %% ======================================
+        %% Management & Ops
+        %% ======================================
         subgraph "Management & Operations"
-            S["Management API<br>manager/api.go"] --> T["API Auth<br>manager/auth.go"]
-            U["Trusted Proxy Discovery<br>util/proxywatcher.go"]
-            V["Stream Proxying<br>filter/stream.go"]
-            W["Port Takeover / OS Hardening<br>filter/orchestration_firewall.go"]
-            X["External Notifications<br>notifier/webhook.go"]
+            S["manager/api.go<br><b>Management API</b>"] --> T["manager/auth.go<br><b>API Auth</b>"]
+            U["util/proxywatcher.go<br><b>Trusted Proxy Discovery</b>"]
+            V["filter/stream.go<br><b>Stream Proxying</b>"]
+            W["filter/orchestration_firewall.go<br><b>OS Hardening / Port Control</b>"]
+            X["notifier/webhook.go<br><b>External Notifications</b>"]
         end
-
+        %% ======================================
+        %% Testing & Tools
+        %% ======================================
         subgraph "Testing & Tools (cmd/)"
             Y["demo_server/main.go"]
             Z["ping/main.go"]
             AA["stress_tool/main.go"]
         end
-
+        %% ======================================
+        %% Supporting Modules
+        %% ======================================
         subgraph "Supporting Modules"
             AB["settings/"]
             AC["store/"]
             AD["logger/"]
             AE["util/"]
         end
-
+        %% Interconnections
         B -.-> E
         C -.-> P
         D -.-> O
