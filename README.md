@@ -49,6 +49,29 @@ graph LR
     AegisEdge -.->|Control| MgmtAPI[:9091]
 ```
 
+### Ports Reference
+
+| Port | Service | Notes |
+|------|---------|-------|
+| 80/443 | HTTP/HTTPS Proxy | Main proxy listener (configurable via `listen_ports`) |
+| 9090 | Prometheus Metrics | `/metrics` endpoint |
+| 9091 | Management API | `PATCH /api/config`, `POST /api/block`, etc. — keep internal! |
+| 6060 | pprof Profiler | `/debug/pprof/` — live CPU/memory profiling |
+| 21/22 | TCP Proxy | Optional TCP shield (SSH, FTP) with PROXY Protocol v1 |
+
+---
+
+### Configuration Presets in `settings/`
+
+| Preset | File | L4 Conn | L7 Rate | WAF/GeoIP/Challenge |
+|--------|------|---------|---------|---------------------|
+| **Performance** | `settings/performance.json` | 0 (bypass) | 50.0 | All disabled |
+| **Standard** | `settings/standard.json` | 10 | 5.0 | All enabled |
+| **Aggressive** | `settings/aggressive.json` | 3 | 1.0 | Strict limits |
+
+---
+
+
 (PS: I'm an engineer who focuses on building things that work reliably under fire, rather than just checking off marketing boxes.)
 
 ---

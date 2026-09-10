@@ -43,15 +43,22 @@ func (f *L4Filter) AllowConnection(addr string) bool {
 
 	key := "l4:conn:" + host
 
-	count, err := f.store.Increment(key, f.IdleTimeout)
+	// Check current count before incrementing
+	current, err := f.store.GetCounter(key)
 	if err != nil {
 		logger.Error("L4 store error (fail open)", "err", err, "ip", host)
 		return true // Fail open
 	}
 
-	if int(count) > f.MaxConnPerIP {
-		logger.Warn("L4 connection limit exceeded", "ip", host, "count", count, "limit", f.MaxConnPerIP)
+	if int(current) >= f.MaxConnPerIP {
+		logger.Warn("L4 connection limit exceeded", "ip", host, "count", current, "limit", f.MaxConnPerIP)
 		return false
+	}
+
+	_, err = f.store.Increment(key, f.IdleTimeout)
+	if err != nil {
+		logger.Error("L4 store error (fail open)", "err", err, "ip", host)
+		return true // Fail open
 	}
 	return true
 }

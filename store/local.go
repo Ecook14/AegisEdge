@@ -108,7 +108,7 @@ func (s *LocalStore) Decrement(key string) (int64, error) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	c := shard.counters[key]
-	c.count--
+	if c.count > 0 { c.count-- }
 	shard.counters[key] = c
 	return c.count, nil
 }
